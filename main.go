@@ -839,28 +839,57 @@ func getBannedIPs() map[string]bool {
     return banned
 }
 
-func generateDisplayMetrics(flows []FlowData, cfg *Config) []Metrics {
+func generateDisplayMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) []Metrics {
     if !cfg.ShowStats {
         return nil
     }
 
-    metrics := make([]Metrics, 0, len(flows))
+    metrics := make([]Metrics, 0, len(flows)+len(ipStats))
     banned := getBannedIPs()
 
+    // Add flow metrics (aggregated by IP pair)
+    flowPairs := make(map[string]struct{ ppsRx, ppsTx, mbpsRx, mbpsTx float64 })
     for _, flow := range flows {
         if !meetsFlowThresholds(flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx, cfg) {
             continue
         }
 
-        // Network perspective already applied in collectFlowData
-        flowPpsRx, flowPpsTx, flowMbpsRx, flowMbpsTx := flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx
+        pairKey := flow.getSrcIP() + "_to_" + flow.getDstIP()
+        pair := flowPairs[pairKey]
+        pair.ppsRx += flow.ppsRx
+        pair.ppsTx += flow.ppsTx
+        pair.mbpsRx += flow.mbpsRx
+        pair.mbpsTx += flow.mbpsTx
+        flowPairs[pairKey] = pair
+    }
 
-        srcIP := flow.getSrcIP()
+    // Convert aggregated flow pairs to metrics
+    for pairKey, pair := range flowPairs {
+        parts := strings.Split(pairKey, "_to_")
+        if len(parts) != 2 {
+            continue
+        }
+        srcIP, dstIP := parts[0], parts[1]
+
         metrics = append(metrics, Metrics{
-            SrcIP: srcIP, DstIP: flow.getDstIP(),
-            PpsRx: flowPpsRx, PpsTx: flowPpsTx,
-            MbpsRx: flowMbpsRx, MbpsTx: flowMbpsTx,
+            SrcIP: srcIP, DstIP: dstIP,
+            PpsRx: pair.ppsRx, PpsTx: pair.ppsTx,
+            MbpsRx: pair.mbpsRx, MbpsTx: pair.mbpsTx,
             Banned: banned[srcIP],
+        })
+    }
+
+    // Add IP metrics (aggregated stats per IP)
+    for ip, stats := range ipStats {
+        if !meetsIPThresholds(stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx, cfg) {
+            continue
+        }
+
+        metrics = append(metrics, Metrics{
+            SrcIP: ip, DstIP: "[TOTAL]", // Mark as IP total
+            PpsRx: stats.ppsRx, PpsTx: stats.ppsTx,
+            MbpsRx: stats.mbpsRx, MbpsTx: stats.mbpsTx,
+            Banned: banned[ip],
         })
     }
 
@@ -1113,7 +1142,7 @@ func processMap(m *ebpf.Map, cfg *Config) {
     }
 
     if cfg.ShowStats {
-        metrics := generateDisplayMetrics(flows, cfg)
+        metrics := generateDisplayMetrics(flows, ipStats, cfg)
         displayStats(metrics, now)
     }
 }
