@@ -216,17 +216,13 @@ func cleanupExistingFilters(linkIndex int, verbose bool, forceCleanup bool) {
             parentName = "egress"
         }
 
-        if verbose {
-            log.Printf("Checking %s filters on interface index %d", parentName, linkIndex)
-        }
+        log.Printf("Checking %s filters on interface index %d", parentName, linkIndex)
 
         // List all filters for this parent
         filters, err := netlink.FilterList(nil, uint32(linkIndex))
 
         if err != nil {
-            if verbose {
-                log.Printf("Could not list %s filters: %v", parentName, err)
-            }
+            log.Printf("Could not list %s filters: %v", parentName, err)
             continue
         }
 
@@ -241,27 +237,20 @@ func cleanupExistingFilters(linkIndex int, verbose bool, forceCleanup bool) {
 
                 if shouldRemove {
                     if verbose {
-                        log.Printf("Removing %s filter: %s (handle: %x, parent: %x)",
-                            parentName, bpfFilter.Name, bpfFilter.Handle, bpfFilter.Parent)
+                        log.Printf("Removing %s filter: %s (handle: %x, parent: %x)", parentName, bpfFilter.Name, bpfFilter.Handle, bpfFilter.Parent)
                     }
 
                     if err := netlink.FilterDel(bpfFilter); err != nil {
-                        if verbose {
-                            log.Printf("Failed to remove %s filter: %v", parentName, err)
-                        }
+                        log.Printf("Failed to remove %s filter: %v", parentName, err)
                     } else {
                         removed++
-                        if verbose {
-                            log.Printf("Successfully removed %s filter", parentName)
-                        }
+                        log.Printf("Successfully removed %s filter", parentName)
                     }
                 }
             } else {
                 // Try to remove non-BPF filters if force cleanup
                 if forceCleanup {
-                    if verbose {
-                        log.Printf("Removing non-BPF %s filter", parentName)
-                    }
+                    log.Printf("Removing non-BPF %s filter", parentName)
                     if err := netlink.FilterDel(filter); err == nil {
                         removed++
                     }
@@ -298,7 +287,7 @@ func cleanupExistingFilters(linkIndex int, verbose bool, forceCleanup bool) {
             if verbose {
                 log.Printf("Removed known %s filter", known.name)
             }
-        } else if verbose {
+        } else {
             log.Printf("Could not remove known %s filter: %v", known.name, err)
         }
     }
@@ -318,7 +307,7 @@ func cleanupExistingFilters(linkIndex int, verbose bool, forceCleanup bool) {
                 if verbose {
                     log.Printf("Removed clsact qdisc using tc command")
                 }
-            } else if verbose {
+            } else {
                 log.Printf("tc command failed: %v", err)
             }
         }
@@ -332,7 +321,7 @@ func cleanupExistingFilters(linkIndex int, verbose bool, forceCleanup bool) {
 }
 
 
-func addFilterWithRetry(filter *netlink.BpfFilter, name string, iface *net.Interface, verbose bool) error {
+func addFilterWithRetry(filter *netlink.BpfFilter, name string, iface *net.Interface) error {
     if err := netlink.FilterAdd(filter); err != nil {
         if strings.Contains(err.Error(), "file exists") {
             log.Printf("%s filter conflict detected, attempting cleanup...", name)
@@ -342,9 +331,7 @@ func addFilterWithRetry(filter *netlink.BpfFilter, name string, iface *net.Inter
                 return fmt.Errorf("FilterAdd %s failed after cleanup: %v\nTry running: sudo ./cleanup-filters.sh %s", name, err2, iface.Name)
             }
         } else {
-            if verbose {
-                log.Printf("FilterAdd %s with handle failed: %v, trying without handle", name, err)
-            }
+            log.Printf("FilterAdd %s with handle failed: %v, trying without handle", name, err)
             filter.Handle = 0
             if err2 := netlink.FilterAdd(filter); err2 != nil {
                 return fmt.Errorf("FilterAdd %s failed: original=%v, retry=%v\nTry running: sudo ./cleanup-filters.sh %s", name, err, err2, iface.Name)
@@ -547,17 +534,15 @@ func main() {
         return
     }
 
-    if config.Verbose {
-        log.Printf("Starting FastFlowIPs collector with config: %+v", config)
-        if len(config.AllowedNets) > 0 {
-            log.Printf("Network filter enabled - monitoring %d network(s):", len(config.AllowedNets))
-            for _, net := range config.AllowedNets {
-                log.Printf("  - %s", net.String())
-            }
-        } else {
-            log.Printf("Network filter disabled - monitoring all IPs")
-        }
-    }
+		log.Printf("Starting FastFlowIPs collector with config: %+v", config)
+		if len(config.AllowedNets) > 0 {
+				log.Printf("Network filter enabled - monitoring %d network(s):", len(config.AllowedNets))
+				for _, net := range config.AllowedNets {
+						log.Printf("  - %s", net.String())
+				}
+		} else {
+				log.Printf("Network filter disabled - monitoring all IPs")
+		}
 
     // Get interface index first (needed for cleanup)
     iface, err := net.InterfaceByName(config.Interface)
@@ -654,7 +639,7 @@ func main() {
         DirectAction: true,
     }
 
-    if err := addFilterWithRetry(filterIngress, "ingress", iface, config.Verbose); err != nil {
+    if err := addFilterWithRetry(filterIngress, "ingress", iface); err != nil {
         log.Fatalf("%v", err)
     }
 
@@ -672,7 +657,7 @@ func main() {
         DirectAction: true,
     }
 
-    if err := addFilterWithRetry(filterEgress, "egress", iface, config.Verbose); err != nil {
+    if err := addFilterWithRetry(filterEgress, "egress", iface); err != nil {
         log.Fatalf("%v", err)
     }
 
@@ -702,9 +687,7 @@ func main() {
         log.Printf("Starting silent monitoring mode (interval: %v)", config.Interval)
     }
 
-    if config.Verbose {
-        log.Printf("Starting collection loop with %v interval", config.Interval)
-    }
+    log.Printf("Starting collection loop with %v interval", config.Interval)
 
     for {
         select {
@@ -995,8 +978,7 @@ func processMap(m *ebpf.Map, cfg *Config) {
 
     for ip, stats := range ipStats {
         if cfg.Verbose && meetsIPThresholds(stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx, cfg) {
-            log.Printf("IP %s%s stats: PPS RX=%.1f TX=%.1f, Mbps RX=%.2f TX=%.2f",
-                ip, networkInfo, stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx)
+            log.Printf("IP %s%s stats: PPS RX=%.1f TX=%.1f, Mbps RX=%.2f TX=%.2f", ip, networkInfo, stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx)
         }
 
         if !banned[ip] {
@@ -1046,9 +1028,7 @@ func sendBatch(metrics []GraphiteMetric, host string, port int, timestamp int64,
     if graphiteConn == nil {
         conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
         if err != nil {
-            if verbose {
-                log.Printf("Failed to connect to Graphite: %v", err)
-            }
+            log.Printf("Failed to connect to Graphite: %v", err)
             return
         }
         graphiteConn = conn
@@ -1056,9 +1036,7 @@ func sendBatch(metrics []GraphiteMetric, host string, port int, timestamp int64,
 
     _, err := graphiteConn.Write([]byte(batch.String()))
     if err != nil {
-        if verbose {
-            log.Printf("Failed to send batch (%d metrics): %v", len(metrics), err)
-        }
+        log.Printf("Failed to send batch (%d metrics): %v", len(metrics), err)
         graphiteConn.Close()
         graphiteConn = nil
     } else if verbose {
