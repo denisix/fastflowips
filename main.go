@@ -880,7 +880,7 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 
         srcSan := sanitizeIP(flow.getSrcIP())
         dstSan := sanitizeIP(flow.getDstIP())
-        base := "network.flows." + srcSan + "_to_" + dstSan
+        base := "fastflowips.flows." + srcSan + "_to_" + dstSan
 
         var hasFlowMetrics bool
         if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
@@ -923,7 +923,7 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
         }
 
         ipSan := sanitizeIP(ip)
-        baseIP := "network.ips." + ipSan
+        baseIP := "fastflowips.ips." + ipSan
 
         var hasIPMetrics bool
         if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
@@ -983,19 +983,19 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 
         var hasFlowMetrics bool
         if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_flows,src=%s,dst=%s,type=pps,direction=rx value=%.6f %d", srcSan, dstSan, graphitePpsRx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=rx value=%.6f %d", srcSan, dstSan, graphitePpsRx, timestamp*1000000000))
             hasFlowMetrics = true
         }
         if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_flows,src=%s,dst=%s,type=pps,direction=tx value=%.6f %d", srcSan, dstSan, graphitePpsTx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=tx value=%.6f %d", srcSan, dstSan, graphitePpsTx, timestamp*1000000000))
             hasFlowMetrics = true
         }
         if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_flows,src=%s,dst=%s,type=mbps,direction=rx value=%.6f %d", srcSan, dstSan, graphiteMbpsRx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=rx value=%.6f %d", srcSan, dstSan, graphiteMbpsRx, timestamp*1000000000))
             hasFlowMetrics = true
         }
         if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_flows,src=%s,dst=%s,type=mbps,direction=tx value=%.6f %d", srcSan, dstSan, graphiteMbpsTx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=tx value=%.6f %d", srcSan, dstSan, graphiteMbpsTx, timestamp*1000000000))
             hasFlowMetrics = true
         }
 
@@ -1025,19 +1025,19 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 
         var hasIPMetrics bool
         if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_ips,ip=%s,type=pps,direction=rx value=%.6f %d", ipSan, stats.ppsRx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=pps,direction=rx value=%.6f %d", ipSan, stats.ppsRx, timestamp*1000000000))
             hasIPMetrics = true
         }
         if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_ips,ip=%s,type=pps,direction=tx value=%.6f %d", ipSan, stats.ppsTx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=pps,direction=tx value=%.6f %d", ipSan, stats.ppsTx, timestamp*1000000000))
             hasIPMetrics = true
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_ips,ip=%s,type=mbps,direction=rx value=%.6f %d", ipSan, stats.mbpsRx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=mbps,direction=rx value=%.6f %d", ipSan, stats.mbpsRx, timestamp*1000000000))
             hasIPMetrics = true
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("network_ips,ip=%s,type=mbps,direction=tx value=%.6f %d", ipSan, stats.mbpsTx, timestamp*1000000000))
+            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=mbps,direction=tx value=%.6f %d", ipSan, stats.mbpsTx, timestamp*1000000000))
             hasIPMetrics = true
         }
 
