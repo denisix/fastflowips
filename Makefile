@@ -1,5 +1,5 @@
 BINARY_NAME := fastflowips
-BPF_CFLAGS := -target bpf -O3 -c -Wall -Werror -D__KERNEL__ -D__BPF_TRACING__ \
+BPF_CFLAGS := -target bpf -O3 -g -c -Wall -Werror -D__KERNEL__ -D__BPF_TRACING__ \
               -I/usr/include -I/usr/include/$(shell uname -m)-linux-gnu -I/usr/include/bpf \
               -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types
 GO_LDFLAGS := -s -w -extldflags '-static'
