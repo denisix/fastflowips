@@ -772,7 +772,11 @@ func collectFlowData(m *ebpf.Map, cfg *Config, deltaTime float64) ([]FlowData, m
                 // Inbound: src=external, dst=internal (swap to make src=internal)
                 swappedKey := FlowKey{Src: k.Dst, Dst: k.Src}
 								k = swappedKey
-            }
+						} else if srcInNetwork && !dstInNetwork {
+								// No swap: internal→external, need to swap RX/TX for internal IP perspective
+								rawPpsRx, rawPpsTx = rawPpsTx, rawPpsRx
+								rawMbpsRx, rawMbpsTx = rawMbpsTx, rawMbpsRx
+						}
         }
 
 				if !ok {
