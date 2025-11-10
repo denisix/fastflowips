@@ -885,22 +885,25 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) 
         dstSan := sanitizeIP(flow.getDstIP())
         base := "network.flows." + srcSan + "_to_" + dstSan
 
-        var flowMetrics []GraphiteMetric
+        var hasFlowMetrics bool
         if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-            flowMetrics = append(flowMetrics, GraphiteMetric{base + ".pps.rx", graphitePpsRx})
+            gMetrics = append(gMetrics, GraphiteMetric{base + ".pps.rx", graphitePpsRx})
+            hasFlowMetrics = true
         }
         if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-            flowMetrics = append(flowMetrics, GraphiteMetric{base + ".pps.tx", graphitePpsTx})
+            gMetrics = append(gMetrics, GraphiteMetric{base + ".pps.tx", graphitePpsTx})
+            hasFlowMetrics = true
         }
         if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-            flowMetrics = append(flowMetrics, GraphiteMetric{base + ".mbps.rx", graphiteMbpsRx})
+            gMetrics = append(gMetrics, GraphiteMetric{base + ".mbps.rx", graphiteMbpsRx})
+            hasFlowMetrics = true
         }
         if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-            flowMetrics = append(flowMetrics, GraphiteMetric{base + ".mbps.tx", graphiteMbpsTx})
+            gMetrics = append(gMetrics, GraphiteMetric{base + ".mbps.tx", graphiteMbpsTx})
+            hasFlowMetrics = true
         }
 
-        if len(flowMetrics) > 0 {
-            gMetrics = append(gMetrics, flowMetrics...)
+        if hasFlowMetrics {
             gStats.FlowCount++
             if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
                 gStats.FlowPpsRx += graphitePpsRx
@@ -923,24 +926,27 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) 
         }
 
         ipSan := sanitizeIP(ip)
-        var ipMetrics []GraphiteMetric
-
         baseIP := "network.ips." + ipSan
+
+        var hasIPMetrics bool
         if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-            ipMetrics = append(ipMetrics, GraphiteMetric{baseIP + ".pps.rx", stats.ppsRx})
+            gMetrics = append(gMetrics, GraphiteMetric{baseIP + ".pps.rx", stats.ppsRx})
+            hasIPMetrics = true
         }
         if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-            ipMetrics = append(ipMetrics, GraphiteMetric{baseIP + ".pps.tx", stats.ppsTx})
+            gMetrics = append(gMetrics, GraphiteMetric{baseIP + ".pps.tx", stats.ppsTx})
+            hasIPMetrics = true
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-            ipMetrics = append(ipMetrics, GraphiteMetric{baseIP + ".mbps.rx", stats.mbpsRx})
+            gMetrics = append(gMetrics, GraphiteMetric{baseIP + ".mbps.rx", stats.mbpsRx})
+            hasIPMetrics = true
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-            ipMetrics = append(ipMetrics, GraphiteMetric{baseIP + ".mbps.tx", stats.mbpsTx})
+            gMetrics = append(gMetrics, GraphiteMetric{baseIP + ".mbps.tx", stats.mbpsTx})
+            hasIPMetrics = true
         }
 
-        if len(ipMetrics) > 0 {
-            gMetrics = append(gMetrics, ipMetrics...)
+        if hasIPMetrics {
             gStats.IPCount++
             if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
                 gStats.IPPpsRx += stats.ppsRx
