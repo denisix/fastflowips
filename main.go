@@ -347,6 +347,14 @@ func installSystemdService(config *Config) error {
         return fmt.Errorf("failed to get executable path: %v", err)
     }
 
+    // Use all current args except remove -install
+    argsStr := strings.Join(os.Args[1:], " ")
+    argsStr = strings.ReplaceAll(argsStr, "-install", "")
+    argsStr = strings.TrimSpace(argsStr)
+    if argsStr != "" {
+        argsStr = " " + argsStr
+    }
+
     serviceContent := fmt.Sprintf(`[Unit]
 Description=FastFlowIPs - eBPF Network Flow Collector
 After=network.target
@@ -354,13 +362,13 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=%s -interface %s
+ExecStart=%s%s
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-`, execPath, config.Interface)
+`, execPath, argsStr)
 
     servicePath := "/etc/systemd/system/fastflowips.service"
     if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
