@@ -37,7 +37,7 @@ type FlowStats struct {
     PacketsTx uint64
     BytesRx   uint64
     BytesTx   uint64
-    LastSeen  uint64
+		LastSeen  uint64
 }
 
 type Metrics struct {
@@ -48,9 +48,10 @@ type Metrics struct {
 
 
 type FlowData struct {
-    key   FlowKey  // key.Src = internal IP, key.Dst = external IP (swapped for outbound flows)
+    key   FlowKey
     stats FlowStats
     ppsRx, ppsTx, mbpsRx, mbpsTx float64
+    srcInNetwork, dstInNetwork bool  // Pre-computed network membership flags
 }
 
 func (f *FlowData) getSrcIP() string {
@@ -68,7 +69,6 @@ var (
     bannedMu sync.RWMutex
     statsMu sync.RWMutex
     graphiteConn net.Conn
-    graphiteMu sync.Mutex
     // IP cache for network filtering
     ipCache = make(map[uint32]bool)
     ipCacheMu sync.RWMutex
@@ -745,37 +745,33 @@ func collectFlowData(m *ebpf.Map, cfg *Config, deltaTime float64) ([]FlowData, m
     var v FlowStats
 
     statsMu.RLock()
+    ebpfFlowCount := 0
     for it.Next(&k, &v) {
+        ebpfFlowCount++
         currentFlowData[k] = v
 
         prev, exists := prevStats[k]
-        if !exists {
-            continue
-        }
+        var rawPpsRx, rawPpsTx, rawMbpsRx, rawMbpsTx float64
 
-        rawPpsRx, rawPpsTx, rawMbpsRx, rawMbpsTx := calculateFlowMetrics(v, prev, deltaTime)
+        if exists {
+            rawPpsRx, rawPpsTx, rawMbpsRx, rawMbpsTx = calculateFlowMetrics(v, prev, deltaTime)
+        }
+        // If no previous stats, rates will be 0 (which is correct for first iteration)
 
 				ok := false
+				srcInNetwork := true
+				dstInNetwork := true
 
         // Normalize flow key so src=internal, dst=external
         if len(cfg.AllowedNets) == 0 {
 						ok = true
         } else {
-            srcInNetwork := isIPAllowed(k.Src, cfg.AllowedNets)
-            dstInNetwork := isIPAllowed(k.Dst, cfg.AllowedNets)
+            srcInNetwork = isIPAllowed(k.Src, cfg.AllowedNets)
+            dstInNetwork = isIPAllowed(k.Dst, cfg.AllowedNets)
 
+						// Accept flows where at least one IP is in our networks
 						if (srcInNetwork || dstInNetwork) {
 							ok = true
-						}
-
-						if !srcInNetwork && dstInNetwork {
-                // Inbound: src=external, dst=internal (swap to make src=internal)
-                swappedKey := FlowKey{Src: k.Dst, Dst: k.Src}
-								k = swappedKey
-						} else if srcInNetwork && !dstInNetwork {
-								// No swap: internal→external, need to swap RX/TX for internal IP perspective
-								rawPpsRx, rawPpsTx = rawPpsTx, rawPpsRx
-								rawMbpsRx, rawMbpsTx = rawMbpsTx, rawMbpsRx
 						}
         }
 
@@ -784,15 +780,21 @@ func collectFlowData(m *ebpf.Map, cfg *Config, deltaTime float64) ([]FlowData, m
 				}
 
 				flows = append(flows, FlowData{
-						key:    k,
-						stats:  v,
-						ppsRx:  rawPpsRx,
-						ppsTx:  rawPpsTx,
-						mbpsRx: rawMbpsRx,
-						mbpsTx: rawMbpsTx,
+						key:          k,
+						stats:        v,
+						ppsRx:        rawPpsRx,
+						ppsTx:        rawPpsTx,
+						mbpsRx:       rawMbpsRx,
+						mbpsTx:       rawMbpsTx,
+						srcInNetwork: srcInNetwork,
+						dstInNetwork: dstInNetwork,
 				})
     }
     statsMu.RUnlock()
+
+    if cfg.Verbose {
+        log.Printf("eBPF flows: %d, processed flows: %d", ebpfFlowCount, len(flows))
+    }
 
     return flows, currentFlowData
 }
@@ -819,10 +821,17 @@ func aggregateIPStats(flows []FlowData, cfg *Config) IPStatsMap {
             ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
             ipStats.addStats(dstIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
         } else {
-            // Network filter enabled - flow.key.Src is always the internal IP
-            // (swapped in collectFlowData for inbound flows)
+            // Network filter enabled - only count IPs that are in our networks
             srcIP := flow.getSrcIP()
-            ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+            dstIP := flow.getDstIP()
+
+            if flow.srcInNetwork {
+                ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+            }
+
+            if flow.dstInNetwork {
+                ipStats.addStats(dstIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+            }
         }
     }
 
@@ -913,23 +922,46 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 
         srcSan := sanitizeIP(flow.getSrcIP())
         dstSan := sanitizeIP(flow.getDstIP())
-        base := "fastflowips.flows." + srcSan + "_to_" + dstSan
+
+        // Create metric names based on internal IP perspective
+        var base, direction string
+        if flow.srcInNetwork && !flow.dstInNetwork {
+            // Outbound flow: internal→external
+						direction = "tx"
+						base = "fastflowips.flows." + srcSan + "_to_" + dstSan 
+
+            // rxBase = "fastflowips.flows." + dstSan + "_to_" + srcSan  // external→internal for RX
+            // txBase = "fastflowips.flows." + srcSan + "_to_" + dstSan  // internal→external for TX
+        } else if !flow.srcInNetwork && flow.dstInNetwork {
+            // Inbound flow: external→internal
+						direction = "rx"
+						base = "fastflowips.flows." + srcSan + "_to_" + dstSan 
+
+            // rxBase = "fastflowips.flows." + srcSan + "_to_" + dstSan  // external→internal for RX
+            // txBase = "fastflowips.flows." + dstSan + "_to_" + srcSan  // internal→external for TX
+        } else {
+						direction = "rx"
+						base = "fastflowips.flows." + srcSan + "_to_" + dstSan 
+            // Both in network or both external - keep as-is
+            // rxBase = "fastflowips.flows." + srcSan + "_to_" + dstSan
+            // txBase = "fastflowips.flows." + srcSan + "_to_" + dstSan
+        }
 
         var hasFlowMetrics bool
         if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", base, graphitePpsRx, timestamp))
+            gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.%s %.6f %d", base, direction, graphitePpsRx, timestamp))
             hasFlowMetrics = true
         }
         if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.tx %.6f %d", base, graphitePpsTx, timestamp))
+            gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.%s %.6f %d", base, direction, graphitePpsTx, timestamp))
             hasFlowMetrics = true
         }
         if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.rx %.6f %d", base, graphiteMbpsRx, timestamp))
+            gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.%s %.6f %d", base, direction, graphiteMbpsRx, timestamp))
             hasFlowMetrics = true
         }
         if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.tx %.6f %d", base, graphiteMbpsTx, timestamp))
+            gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.%s %.6f %d", base, direction, graphiteMbpsTx, timestamp))
             hasFlowMetrics = true
         }
 
@@ -1169,9 +1201,6 @@ func sendGraphiteBatch(metrics []string, host string, port int, verbose bool, st
     }
 
     // Send entire batch in one TCP write
-    graphiteMu.Lock()
-    defer graphiteMu.Unlock()
-
     if graphiteConn == nil {
         conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
         if err != nil {
