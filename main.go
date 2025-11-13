@@ -69,6 +69,7 @@ var (
     bannedMu sync.RWMutex
     statsMu sync.RWMutex
     graphiteConn net.Conn
+    graphiteMu sync.Mutex
     // IP cache for network filtering
     ipCache = make(map[uint32]bool)
     ipCacheMu sync.RWMutex
@@ -1200,7 +1201,11 @@ func sendGraphiteBatch(metrics []string, host string, port int, verbose bool, st
         batch.WriteByte('\n')
     }
 
-    // Send entire batch in one TCP write
+    // Send entire batch in one TCP write with thread-safe connection management
+    graphiteMu.Lock()
+    defer graphiteMu.Unlock()
+
+    // Check if connection is nil or closed, establish new connection if needed
     if graphiteConn == nil {
         conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
         if err != nil {
@@ -1210,11 +1215,20 @@ func sendGraphiteBatch(metrics []string, host string, port int, verbose bool, st
         graphiteConn = conn
     }
 
+    // Defensive check to ensure connection is still valid
+    if graphiteConn == nil {
+        log.Printf("Graphite connection is unexpectedly nil")
+        return
+    }
+
     _, err := graphiteConn.Write([]byte(batch.String()))
     if err != nil {
         log.Printf("Failed to send batch (%d metrics): %v", len(metrics), err)
-        graphiteConn.Close()
-        graphiteConn = nil
+        // Safely close and reset connection
+        if graphiteConn != nil {
+            graphiteConn.Close()
+            graphiteConn = nil
+        }
     } else if verbose {
         log.Printf("Sent %d metrics to Graphite: %d flows (%.1f/%.1f PPS RX/TX, %.2f/%.2f Mbps RX/TX), %d IPs (%.1f/%.1f PPS RX/TX, %.2f/%.2f Mbps RX/TX)",
             len(metrics), stats.FlowCount, stats.FlowPpsRx, stats.FlowPpsTx, stats.FlowMbpsRx, stats.FlowMbpsTx,
