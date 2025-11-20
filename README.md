@@ -2,6 +2,14 @@
 
 # FastFlowIPs
 
+[![License](https://img.shields.io/badge/license-Custom-blue.svg)](./LICENSE)
+[![Go](https://img.shields.io/badge/go-1.19+-blue.svg)](https://golang.org)
+[![eBPF](https://img.shields.io/badge/eBPF-enabled-green.svg)](https://ebpf.io)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](https://kernel.org)
+[![Architecture](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-lightgrey.svg)](https://github.com)
+[![Build](https://img.shields.io/badge/build-static-brightgreen.svg)](./Makefile)
+[![Performance](https://img.shields.io/badge/performance-high--traffic-orange.svg)](./SUMMARY.md)
+
 High-performance eBPF network monitoring tool that tracks per-IP traffic statistics in real-time. Built for production environments with minimal overhead.
 
 ## What it does
