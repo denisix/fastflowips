@@ -1,3 +1,5 @@
+![FastFlowIPs Cover](./fastflowips-cover.webp)
+
 # FastFlowIPs
 
 High-performance eBPF network monitoring tool that tracks per-IP traffic statistics in real-time. Built for production environments with minimal overhead.

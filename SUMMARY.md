@@ -4,17 +4,19 @@
 eBPF-based tool for real-time per-IP traffic monitoring with dual metrics export (Graphite/InfluxDB) and threshold-based banning.
 
 ## Recent Updates
-- **InfluxDB Support**: Added complete InfluxDB line protocol export alongside existing Graphite
+- **Flow Direction Fix**: Corrected RX/TX perspective for proper internal IP viewpoint in graphs
+- **Thread-Safe Connections**: Fixed Graphite connection race conditions preventing crashes
+- **Systemd Quoting**: Preserved argument quotes in service installation for multi-word parameters
+- **Network Filtering**: Optimized IP membership checks with pre-computed boolean flags
 - **Dual Metrics**: Separate `generateGraphiteMetrics()` and `generateInfluxMetrics()` functions
-- **Flow Direction**: Eliminated perspective complexity by normalizing flow keys (src=internal, dst=external)
-- **Optimized Aggregation**: Direct IP stats without intermediate arrays or complex logic
 - **Test Environment**: Docker scripts for Graphite + InfluxDB + Chronograf with web UIs
 - **Static Compilation**: Simplified Makefile with cross-arch builds (amd64/arm64) + UPX compression
 
 ## Architecture
 **Core**: eBPF (flow.c) → Go collector → Graphite/InfluxDB export + IP banning
-**Metrics**: Flow pairs (`network.flows.src_to_dst.*`) + IP aggregates (`network.ips.ip.*`)
-**Direction**: RX=to-network, TX=from-network (consistent across all outputs)
+**Metrics**: Flow pairs (`fastflowips.flows.src_to_dst.*`) + IP aggregates (`fastflowips.ips.ip.*`)
+**Direction**: RX=traffic-to-internal, TX=traffic-from-internal (internal IP perspective)
+**Threading**: Thread-safe metrics export with mutex-protected connections
 
 ## Configuration
 ```bash
@@ -33,8 +35,8 @@ eBPF-based tool for real-time per-IP traffic monitoring with dual metrics export
 ```
 
 ## Formats
-**Graphite**: `network.flows.192_168_1_1_to_10_0_0_1.pps.rx 123.45 1699123456`
-**InfluxDB**: `network_flows,src=192_168_1_1,dst=10_0_0_1,type=pps,direction=rx value=123.45 1699123456000000000`
+**Graphite**: `fastflowips.flows.192_168_1_1_to_10_0_0_1.pps.rx 123.45 1699123456`
+**InfluxDB**: `fastflowips_flows,src=192_168_1_1,dst=10_0_0_1,type=pps,direction=rx value=123.45 1699123456000000000`
 
 ## Development Environment
 ```bash
@@ -50,4 +52,4 @@ sudo ./fastflowips -install    # systemd service with current args (excludes -in
 sudo ./fastflowips -networks "10.0.0.0/8" -graphite-host metrics.local -ban-pps-rx 5000
 ```
 
-**Performance**: 75% fewer mutex ops, 60% faster strings, 50% fewer allocations. Production-ready for high-traffic monitoring.
+**Performance**: Thread-safe operations, optimized network filtering, efficient flow aggregation. Production-ready for high-traffic monitoring with crash-resistant connection handling.
