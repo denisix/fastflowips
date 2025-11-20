@@ -325,9 +325,19 @@ func installSystemdService(config *Config) error {
         return fmt.Errorf("failed to get executable path: %v", err)
     }
 
-    // Use all current args except remove -install
-    argsStr := strings.Join(os.Args[1:], " ")
-    argsStr = strings.ReplaceAll(argsStr, "-install", "")
+    // Use all current args except -install, preserving quotes for args with spaces
+    var filteredArgs []string
+    for _, arg := range os.Args[1:] {
+        if arg != "-install" {
+            // Quote argument if it contains spaces and isn't already quoted
+            if strings.Contains(arg, " ") && !strings.HasPrefix(arg, "'") && !strings.HasPrefix(arg, "\"") {
+                filteredArgs = append(filteredArgs, fmt.Sprintf("'%s'", arg))
+            } else {
+                filteredArgs = append(filteredArgs, arg)
+            }
+        }
+    }
+    argsStr := strings.Join(filteredArgs, " ")
     argsStr = strings.TrimSpace(argsStr)
     if argsStr != "" {
         argsStr = " " + argsStr
