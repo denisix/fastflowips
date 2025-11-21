@@ -41,11 +41,11 @@ type FlowStats struct {
 }
 
 type Metrics struct {
-    SrcIP, DstIP string
-    PpsRx, PpsTx, MbpsRx, MbpsTx float64
-    Banned bool
+    srcIP, dstIP string
+    ppsRx, ppsTx, mbpsRx, mbpsTx float64
+    banned bool
+		tx bool
 }
-
 
 type FlowData struct {
     key   FlowKey
@@ -389,7 +389,7 @@ func runScript(script, action, ip string) {
     }
 }
 
-func banIP(ip string, duration time.Duration, script string) {
+func banIP(ip string, duration time.Duration, script string, ppsRx, ppsTx, mbpsRx, mbpsTx float64) {
     bannedMu.Lock()
     defer bannedMu.Unlock()
 
@@ -398,7 +398,7 @@ func banIP(ip string, duration time.Duration, script string) {
     }
 
     bannedIPs[ip] = &Ban{Start: time.Now(), Duration: duration}
-    log.Printf("BANNED IP: %s for %v", ip, duration)
+    log.Printf("BANNED IP: %s for %v (%.1f/%.1f pps, %.2f/%.2f mbps)", ip, duration, ppsRx, ppsTx, mbpsRx, mbpsTx)
     runScript(script, "ban", ip)
 }
 
@@ -429,33 +429,14 @@ func checkExpiredBans(script string) {
     }
 }
 
-
 func meetsFlowThresholds(ppsRx, ppsTx, mbpsRx, mbpsTx float64, cfg *Config) bool {
-    totalPps, totalMbps := ppsRx+ppsTx, mbpsRx+mbpsTx
-    return (totalPps > 0 || totalMbps > 0) &&
-           (cfg.MinFlowPps <= 0 || totalPps >= cfg.MinFlowPps) &&
-           (cfg.MinFlowMbps <= 0 || totalMbps >= cfg.MinFlowMbps)
+    return (cfg.MinFlowPps <= 0 || ppsRx >= cfg.MinFlowPps || ppsTx >= cfg.MinFlowPps) &&
+           (cfg.MinFlowMbps <= 0 || mbpsRx >= cfg.MinFlowMbps || mbpsTx >= cfg.MinFlowMbps)
 }
 
 func meetsIPThresholds(ppsRx, ppsTx, mbpsRx, mbpsTx float64, cfg *Config) bool {
-    totalPps, totalMbps := ppsRx+ppsTx, mbpsRx+mbpsTx
-    return (totalPps > 0 || totalMbps > 0) &&
-           (cfg.MinIPsPps <= 0 || totalPps >= cfg.MinIPsPps) &&
-           (cfg.MinIPsMbps <= 0 || totalMbps >= cfg.MinIPsMbps)
-}
-
-func checkThresholds(ip string, ppsRx, ppsTx, mbpsRx, mbpsTx float64, cfg *Config) bool {
-    if (cfg.BanPpsRx > 0 && ppsRx > cfg.BanPpsRx) ||
-       (cfg.BanPpsTx > 0 && ppsTx > cfg.BanPpsTx) ||
-       (cfg.BanMbpsRx > 0 && mbpsRx > cfg.BanMbpsRx) ||
-       (cfg.BanMbpsTx > 0 && mbpsTx > cfg.BanMbpsTx) {
-
-        log.Printf("THRESHOLD VIOLATION: %s (%.1f/%.1f pps, %.2f/%.2f mbps)",
-            ip, ppsRx, ppsTx, mbpsRx, mbpsTx)
-        banIP(ip, cfg.BanTime, cfg.BanScript)
-        return true
-    }
-    return false
+    return (cfg.MinIPsPps <= 0 || ppsRx >= cfg.MinIPsPps || ppsTx >= cfg.MinIPsPps) &&
+           (cfg.MinIPsMbps <= 0 || mbpsRx >= cfg.MinIPsMbps || mbpsTx >= cfg.MinIPsMbps)
 }
 
 func parseFlags() *Config {
@@ -485,11 +466,11 @@ func parseFlags() *Config {
     flag.DurationVar(&config.BanTime, "ban-time", 300*time.Second, "Duration to ban IPs that exceed thresholds")
     flag.StringVar(&config.BanScript, "ban-script", "", "Script to execute on ban/unban actions (e.g., /path/to/script.sh)")
 
-    // Minimum thresholds for Graphite flow and IP metrics
-    flag.Float64Var(&config.MinFlowPps, "min-flow-pps", 0, "Minimum PPS threshold for flow-based Graphite metrics (0 = export all flows)")
-    flag.Float64Var(&config.MinFlowMbps, "min-flow-mbps", 0, "Minimum Mbps threshold for flow-based Graphite metrics (0 = export all flows)")
-    flag.Float64Var(&config.MinIPsPps, "min-ips-pps", 0, "Minimum PPS threshold for IP-based Graphite metrics (0 = export all IPs)")
-    flag.Float64Var(&config.MinIPsMbps, "min-ips-mbps", 0, "Minimum Mbps threshold for IP-based Graphite metrics (0 = export all IPs)")
+    // Minimum thresholds for flow/ip metrics reporting
+    flag.Float64Var(&config.MinFlowPps, "min-flow-pps", 0, "Minimum PPS threshold for flow-based metrics (0 = export all flows)")
+    flag.Float64Var(&config.MinFlowMbps, "min-flow-mbps", 0, "Minimum Mbps threshold for flow-based metrics (0 = export all flows)")
+    flag.Float64Var(&config.MinIPsPps, "min-ips-pps", 0, "Minimum PPS threshold for IP-based metrics (0 = export all IPs)")
+    flag.Float64Var(&config.MinIPsMbps, "min-ips-mbps", 0, "Minimum Mbps threshold for IP-based metrics (0 = export all IPs)")
 
     // Performance settings
     flag.IntVar(&config.IPCacheSize, "ip-cache-size", 100000, "Maximum IP cache size before clearing (higher = better performance, more memory)")
@@ -500,11 +481,12 @@ func parseFlags() *Config {
         fmt.Fprintf(os.Stderr, "Options:\n")
         flag.PrintDefaults()
         fmt.Fprintf(os.Stderr, "\nExamples:\n")
-        fmt.Fprintf(os.Stderr, "  %s -show-stats -graphite-host localhost\n", os.Args[0])
-        fmt.Fprintf(os.Stderr, "  %s -influx-url http://localhost:8086 -influx-db fastflowips\n", os.Args[0])
-        fmt.Fprintf(os.Stderr, "  %s -ban-pps-rx 1000 -ban-script ./ban.sh\n", os.Args[0])
-        fmt.Fprintf(os.Stderr, "  sudo %s -install -interface eth0\n", os.Args[0])
-        fmt.Fprintf(os.Stderr, "\nRequires root privileges. Ban script args: <action> <ip>\n")
+        fmt.Fprintf(os.Stderr, "\t%s -interface eth2 -show-stats\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "\t%s -graphite-host localhost\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "\t%s -influx-url http://localhost:8086 -influx-db fastflowips\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "\t%s -ban-pps-rx 1000 -ban-script ./ban.sh\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "\t%s -interface eth0 -graphite-host localhost -install\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "\nRequires root privileges.\nBan script args: <action> <ip>\n")
     }
 
     flag.Parse()
@@ -833,15 +815,14 @@ func aggregateIPStats(flows []FlowData, cfg *Config) IPStatsMap {
             ipStats.addStats(dstIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
         } else {
             // Network filter enabled - only count IPs that are in our networks
-            srcIP := flow.getSrcIP()
-            dstIP := flow.getDstIP()
-
             if flow.srcInNetwork {
-                ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+            	srcIP := flow.getSrcIP()
+              ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
             }
 
             if flow.dstInNetwork {
-                ipStats.addStats(dstIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+            	dstIP := flow.getDstIP()
+              ipStats.addStats(dstIP, flow.ppsTx, flow.ppsRx, flow.mbpsTx, flow.mbpsRx)
             }
         }
     }
@@ -849,54 +830,42 @@ func aggregateIPStats(flows []FlowData, cfg *Config) IPStatsMap {
     return ipStats
 }
 
-func getBannedIPs() map[string]bool {
+func isIPBanned(ip string) bool {
     bannedMu.RLock()
     defer bannedMu.RUnlock()
-    banned := make(map[string]bool, len(bannedIPs))
-    for ip := range bannedIPs {
-        banned[ip] = true
-    }
+    _, banned := bannedIPs[ip]
     return banned
 }
 
-func generateDisplayMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) []Metrics {
-    if !cfg.ShowStats {
-        return nil
-    }
-
+func generateDisplayMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) {
     metrics := make([]Metrics, 0, len(flows)+len(ipStats))
-    banned := getBannedIPs()
 
-    // Add flow metrics (aggregated by IP pair)
-    flowPairs := make(map[string]struct{ ppsRx, ppsTx, mbpsRx, mbpsTx float64 })
     for _, flow := range flows {
         if !meetsFlowThresholds(flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx, cfg) {
             continue
         }
 
-        pairKey := flow.getSrcIP() + "_to_" + flow.getDstIP()
-        pair := flowPairs[pairKey]
-        pair.ppsRx += flow.ppsRx
-        pair.ppsTx += flow.ppsTx
-        pair.mbpsRx += flow.mbpsRx
-        pair.mbpsTx += flow.mbpsTx
-        flowPairs[pairKey] = pair
-    }
+        srcIP := flow.getSrcIP()
 
-    // Convert aggregated flow pairs to metrics
-    for pairKey, pair := range flowPairs {
-        parts := strings.Split(pairKey, "_to_")
-        if len(parts) != 2 {
-            continue
-        }
-        srcIP, dstIP := parts[0], parts[1]
+				// direction := "rx"
+				tx := false
+
+        // Outbound flow: internal→external
+        if flow.srcInNetwork && !flow.dstInNetwork {
+					// direction = "tx"
+					tx = true
+				}
 
         metrics = append(metrics, Metrics{
-            SrcIP: srcIP, DstIP: dstIP,
-            PpsRx: pair.ppsRx, PpsTx: pair.ppsTx,
-            MbpsRx: pair.mbpsRx, MbpsTx: pair.mbpsTx,
-            Banned: banned[srcIP],
-        })
+					srcIP: srcIP, 
+					dstIP: flow.getDstIP(),
+					ppsRx: flow.ppsRx,
+					ppsTx: flow.ppsTx,
+					mbpsRx: flow.mbpsRx,
+					mbpsTx: flow.mbpsTx,
+					banned: isIPBanned(srcIP),
+					tx: tx,
+				})
     }
 
     // Add IP metrics (aggregated stats per IP)
@@ -906,91 +875,75 @@ func generateDisplayMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) [
         }
 
         metrics = append(metrics, Metrics{
-            SrcIP: ip, DstIP: "[TOTAL]", // Mark as IP total
-            PpsRx: stats.ppsRx, PpsTx: stats.ppsTx,
-            MbpsRx: stats.mbpsRx, MbpsTx: stats.mbpsTx,
-            Banned: banned[ip],
+            srcIP: ip, dstIP: "[TOTAL]", // Mark as IP total
+            ppsRx: stats.ppsRx, ppsTx: stats.ppsTx,
+            mbpsRx: stats.mbpsRx, mbpsTx: stats.mbpsTx,
+            banned: isIPBanned(ip),
+						tx: true,
         })
     }
 
-    return metrics
+		// display stats
+    sort.Slice(metrics, func(i, j int) bool {
+        return metrics[i].ppsRx+metrics[i].ppsTx > metrics[j].ppsRx+metrics[j].ppsTx
+    })
+
+    bannedMu.RLock()
+    if count := len(bannedIPs); count > 0 {
+        fmt.Printf("Banned IPs: %d\n", count)
+    }
+    bannedMu.RUnlock()
+
+		if len(metrics) > 0 {
+			fmt.Printf("%-20s %-20s %8s %8s %8s %8s %6s\n", "srcIP", "dstIP", "ppsRX", "ppsTX", "mbpsRX", "mbpsTX", "status")
+			fmt.Printf("%s\n", "____________________________________________________________________________________")
+
+			for _, m := range metrics {
+					status := "OK"
+					if m.banned {
+							status = "BAN"
+					}
+
+					fmt.Printf("%-20s %-20s %8.1f %8.1f %8.2f %8.2f %6s\n", m.srcIP, m.dstIP, m.ppsRx, m.ppsTx, m.mbpsRx, m.mbpsTx, status)
+			}
+			fmt.Printf("%s\n\n", "____________________________________________________________________________________")
+		} else {
+			fmt.Printf("%s\n", "-- no metrics --")
+		}
 }
 
-func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, timestamp int64) ([]string, GraphiteStats) {
-    if cfg.GraphiteHost == "" {
-        return nil, GraphiteStats{}
-    }
-
+func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, timestamp int64) {
     var gMetrics []string
-    var gStats GraphiteStats
 
     for _, flow := range flows {
         if !meetsFlowThresholds(flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx, cfg) {
             continue
         }
 
-        graphitePpsRx, graphitePpsTx, graphiteMbpsRx, graphiteMbpsTx := flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx
-
         srcSan := sanitizeIP(flow.getSrcIP())
         dstSan := sanitizeIP(flow.getDstIP())
 
         // Create metric names based on internal IP perspective
-        var base, direction string
+				direction := "rx"
+				base := "fastflowips.flows." + srcSan + "_to_" + dstSan
+
+        // Outbound flow: internal→external
         if flow.srcInNetwork && !flow.dstInNetwork {
-            // Outbound flow: internal→external
 						direction = "tx"
-						base = "fastflowips.flows." + srcSan + "_to_" + dstSan 
-
-            // rxBase = "fastflowips.flows." + dstSan + "_to_" + srcSan  // external→internal for RX
-            // txBase = "fastflowips.flows." + srcSan + "_to_" + dstSan  // internal→external for TX
-        } else if !flow.srcInNetwork && flow.dstInNetwork {
-            // Inbound flow: external→internal
-						direction = "rx"
-						base = "fastflowips.flows." + srcSan + "_to_" + dstSan 
-
-            // rxBase = "fastflowips.flows." + srcSan + "_to_" + dstSan  // external→internal for RX
-            // txBase = "fastflowips.flows." + dstSan + "_to_" + srcSan  // internal→external for TX
-        } else {
-						direction = "rx"
-						base = "fastflowips.flows." + srcSan + "_to_" + dstSan 
-            // Both in network or both external - keep as-is
-            // rxBase = "fastflowips.flows." + srcSan + "_to_" + dstSan
-            // txBase = "fastflowips.flows." + srcSan + "_to_" + dstSan
         }
 
-        var hasFlowMetrics bool
-        if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.%s %.6f %d", base, direction, graphitePpsRx, timestamp))
-            hasFlowMetrics = true
-        }
-        if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.%s %.6f %d", base, direction, graphitePpsTx, timestamp))
-            hasFlowMetrics = true
-        }
-        if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.%s %.6f %d", base, direction, graphiteMbpsRx, timestamp))
-            hasFlowMetrics = true
-        }
-        if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.%s %.6f %d", base, direction, graphiteMbpsTx, timestamp))
-            hasFlowMetrics = true
-        }
-
-        if hasFlowMetrics {
-            gStats.FlowCount++
-            if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-                gStats.FlowPpsRx += graphitePpsRx
-            }
-            if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-                gStats.FlowPpsTx += graphitePpsTx
-            }
-            if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-                gStats.FlowMbpsRx += graphiteMbpsRx
-            }
-            if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-                gStats.FlowMbpsTx += graphiteMbpsTx
-            }
-        }
+				if cfg.MinFlowPps == 0 || flow.ppsRx >= cfg.MinFlowPps {
+						gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.%s %.6f %d", base, direction, flow.ppsRx, timestamp))
+				}
+				if cfg.MinFlowPps == 0 || flow.ppsTx >= cfg.MinFlowPps {
+						gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.%s %.6f %d", base, direction, flow.ppsTx, timestamp))
+				}
+				if cfg.MinFlowMbps == 0 || flow.mbpsRx >= cfg.MinFlowMbps {
+						gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.%s %.6f %d", base, direction, flow.mbpsRx, timestamp))
+				}
+				if cfg.MinFlowMbps == 0 || flow.mbpsTx >= cfg.MinFlowMbps {
+						gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.%s %.6f %d", base, direction, flow.mbpsTx, timestamp))
+				}
     }
 
     for ip, stats := range ipStats {
@@ -1001,94 +954,57 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
         ipSan := sanitizeIP(ip)
         baseIP := "fastflowips.ips." + ipSan
 
-        var hasIPMetrics bool
         if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
             gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", baseIP, stats.ppsRx, timestamp))
-            hasIPMetrics = true
         }
         if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
             gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.tx %.6f %d", baseIP, stats.ppsTx, timestamp))
-            hasIPMetrics = true
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
             gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.rx %.6f %d", baseIP, stats.mbpsRx, timestamp))
-            hasIPMetrics = true
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
             gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.tx %.6f %d", baseIP, stats.mbpsTx, timestamp))
-            hasIPMetrics = true
-        }
-
-        if hasIPMetrics {
-            gStats.IPCount++
-            if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-                gStats.IPPpsRx += stats.ppsRx
-            }
-            if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-                gStats.IPPpsTx += stats.ppsTx
-            }
-            if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-                gStats.IPMbpsRx += stats.mbpsRx
-            }
-            if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-                gStats.IPMbpsTx += stats.mbpsTx
-            }
         }
     }
 
-    return gMetrics, gStats
+		if len(gMetrics) > 0 {
+				go sendGraphiteBatch(gMetrics, cfg)
+		}
 }
 
-func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, timestamp int64) ([]string, GraphiteStats) {
-    if cfg.InfluxURL == "" {
-        return nil, GraphiteStats{}
-    }
-
+func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, timestamp int64) {
     var gMetrics []string
-    var gStats GraphiteStats
+    ts := fmt.Sprintf("%d", timestamp*1000000000)
 
     for _, flow := range flows {
         if !meetsFlowThresholds(flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx, cfg) {
             continue
         }
 
-        graphitePpsRx, graphitePpsTx, graphiteMbpsRx, graphiteMbpsTx := flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx
-
         srcSan := sanitizeIP(flow.getSrcIP())
         dstSan := sanitizeIP(flow.getDstIP())
+        
+				// Create metric names based on internal IP perspective
+				direction := "rx"
 
-        var hasFlowMetrics bool
-        if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=rx value=%.6f %d", srcSan, dstSan, graphitePpsRx, timestamp*1000000000))
-            hasFlowMetrics = true
-        }
-        if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=tx value=%.6f %d", srcSan, dstSan, graphitePpsTx, timestamp*1000000000))
-            hasFlowMetrics = true
-        }
-        if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=rx value=%.6f %d", srcSan, dstSan, graphiteMbpsRx, timestamp*1000000000))
-            hasFlowMetrics = true
-        }
-        if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=tx value=%.6f %d", srcSan, dstSan, graphiteMbpsTx, timestamp*1000000000))
-            hasFlowMetrics = true
+				base := "fastflowips_flows,src=" + srcSan + ",dst=" + dstSan + ",type=%s,direction=%s value=%.6f " + ts
+        // Outbound flow: internal→external
+        if flow.srcInNetwork && !flow.dstInNetwork {
+						direction = "tx"
         }
 
-        if hasFlowMetrics {
-            gStats.FlowCount++
-            if cfg.MinFlowPps == 0 || graphitePpsRx >= cfg.MinFlowPps {
-                gStats.FlowPpsRx += graphitePpsRx
-            }
-            if cfg.MinFlowPps == 0 || graphitePpsTx >= cfg.MinFlowPps {
-                gStats.FlowPpsTx += graphitePpsTx
-            }
-            if cfg.MinFlowMbps == 0 || graphiteMbpsRx >= cfg.MinFlowMbps {
-                gStats.FlowMbpsRx += graphiteMbpsRx
-            }
-            if cfg.MinFlowMbps == 0 || graphiteMbpsTx >= cfg.MinFlowMbps {
-                gStats.FlowMbpsTx += graphiteMbpsTx
-            }
+        if cfg.MinFlowPps == 0 || flow.ppsRx >= cfg.MinFlowPps {
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "pps", direction, flow.ppsRx))
+        }
+        if cfg.MinFlowPps == 0 || flow.ppsTx >= cfg.MinFlowPps {
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "pps", direction, flow.ppsTx))
+        }
+        if cfg.MinFlowMbps == 0 || flow.mbpsRx >= cfg.MinFlowMbps {
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "mbps", direction, flow.mbpsRx))
+        }
+        if cfg.MinFlowMbps == 0 || flow.mbpsTx >= cfg.MinFlowMbps {
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "mbps", direction, flow.mbpsTx))
         }
     }
 
@@ -1098,43 +1014,25 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
         }
 
         ipSan := sanitizeIP(ip)
+				base := "fastflowips_ips,ip=" + ipSan + ",type=%s,direction=%s value=%.6f " + ts
 
-        var hasIPMetrics bool
         if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=pps,direction=rx value=%.6f %d", ipSan, stats.ppsRx, timestamp*1000000000))
-            hasIPMetrics = true
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "pps", "rx", stats.ppsRx))
         }
         if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=pps,direction=tx value=%.6f %d", ipSan, stats.ppsTx, timestamp*1000000000))
-            hasIPMetrics = true
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "pps", "tx", stats.ppsTx))
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=mbps,direction=rx value=%.6f %d", ipSan, stats.mbpsRx, timestamp*1000000000))
-            hasIPMetrics = true
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "mbps", "rx", stats.mbpsRx))
         }
         if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-            gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_ips,ip=%s,type=mbps,direction=tx value=%.6f %d", ipSan, stats.mbpsTx, timestamp*1000000000))
-            hasIPMetrics = true
-        }
-
-        if hasIPMetrics {
-            gStats.IPCount++
-            if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-                gStats.IPPpsRx += stats.ppsRx
-            }
-            if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-                gStats.IPPpsTx += stats.ppsTx
-            }
-            if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-                gStats.IPMbpsRx += stats.mbpsRx
-            }
-            if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-                gStats.IPMbpsTx += stats.mbpsTx
-            }
+            gMetrics = append(gMetrics, fmt.Sprintf(base, "mbps", "tx", stats.mbpsTx))
         }
     }
 
-    return gMetrics, gStats
+		if len(gMetrics) > 0 {
+				go sendInfluxBatch(gMetrics, cfg)
+		}
 }
 
 
@@ -1155,15 +1053,18 @@ func processMap(m *ebpf.Map, cfg *Config) {
     statsMu.Unlock()
 
     ipStats := aggregateIPStats(flows, cfg)
-    banned := getBannedIPs()
 
     for ip, stats := range ipStats {
         if cfg.Verbose && meetsIPThresholds(stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx, cfg) {
             log.Printf("IP %s stats: PPS RX=%.1f TX=%.1f, Mbps RX=%.2f TX=%.2f", ip, stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx)
         }
 
-        if !banned[ip] {
-            checkThresholds(ip, stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx, cfg)
+        if (!isIPBanned(ip) && (
+					(cfg.BanPpsRx > 0 && stats.ppsRx > cfg.BanPpsRx) ||
+					(cfg.BanPpsTx > 0 && stats.ppsTx > cfg.BanPpsTx) ||
+					(cfg.BanMbpsRx > 0 && stats.mbpsRx > cfg.BanMbpsRx) ||
+					(cfg.BanMbpsTx > 0 && stats.mbpsTx > cfg.BanMbpsTx))) {
+        		banIP(ip, cfg.BanTime, cfg.BanScript, stats.ppsRx, stats.ppsTx, stats.mbpsRx, stats.mbpsTx)
         }
     }
 
@@ -1172,36 +1073,17 @@ func processMap(m *ebpf.Map, cfg *Config) {
     clearIPCacheIfNeeded(cfg.IPCacheSize)
 
     if cfg.GraphiteHost != "" {
-        gMetrics, gStats := generateGraphiteMetrics(flows, ipStats, cfg, now.Unix())
-        if len(gMetrics) > 0 {
-            go sendGraphiteBatch(gMetrics, cfg.GraphiteHost, cfg.GraphitePort, cfg.Verbose, &gStats)
-        }
+        generateGraphiteMetrics(flows, ipStats, cfg, now.Unix())
     }
     if cfg.InfluxURL != "" {
-        iMetrics, iStats := generateInfluxMetrics(flows, ipStats, cfg, now.Unix())
-        if len(iMetrics) > 0 {
-            go sendInfluxBatch(iMetrics, cfg, cfg.Verbose, &iStats)
-        }
+        generateInfluxMetrics(flows, ipStats, cfg, now.Unix())
     }
-
     if cfg.ShowStats {
-        metrics := generateDisplayMetrics(flows, ipStats, cfg)
-        displayStats(metrics, now)
+        generateDisplayMetrics(flows, ipStats, cfg)
     }
 }
 
-type GraphiteStats struct {
-    FlowCount int
-    IPCount   int
-    FlowPpsRx, FlowPpsTx, FlowMbpsRx, FlowMbpsTx float64
-    IPPpsRx, IPPpsTx, IPMbpsRx, IPMbpsTx float64
-}
-
-func sendGraphiteBatch(metrics []string, host string, port int, verbose bool, stats *GraphiteStats) {
-    if len(metrics) == 0 {
-        return
-    }
-
+func sendGraphiteBatch(metrics []string, cfg *Config) {
     // Build batch message
     var batch strings.Builder
     batch.Grow(len(metrics) * 50) // Pre-allocate approximate space
@@ -1217,7 +1099,7 @@ func sendGraphiteBatch(metrics []string, host string, port int, verbose bool, st
 
     // Check if connection is nil or closed, establish new connection if needed
     if graphiteConn == nil {
-        conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+        conn, err := net.Dial("tcp", net.JoinHostPort(cfg.GraphiteHost, strconv.Itoa(cfg.GraphitePort)))
         if err != nil {
             log.Printf("Failed to connect to Graphite: %v", err)
             return
@@ -1239,18 +1121,12 @@ func sendGraphiteBatch(metrics []string, host string, port int, verbose bool, st
             graphiteConn.Close()
             graphiteConn = nil
         }
-    } else if verbose {
-        log.Printf("Sent %d metrics to Graphite: %d flows (%.1f/%.1f PPS RX/TX, %.2f/%.2f Mbps RX/TX), %d IPs (%.1f/%.1f PPS RX/TX, %.2f/%.2f Mbps RX/TX)",
-            len(metrics), stats.FlowCount, stats.FlowPpsRx, stats.FlowPpsTx, stats.FlowMbpsRx, stats.FlowMbpsTx,
-            stats.IPCount, stats.IPPpsRx, stats.IPPpsTx, stats.IPMbpsRx, stats.IPMbpsTx)
+    } else if cfg.Verbose {
+        log.Printf("Sent %d metrics to Graphite", len(metrics))
     }
 }
 
-func sendInfluxBatch(metrics []string, cfg *Config, verbose bool, stats *GraphiteStats) {
-    if len(metrics) == 0 {
-        return
-    }
-
+func sendInfluxBatch(metrics []string, cfg *Config) {
     // Build InfluxDB batch message
     var batch strings.Builder
     batch.Grow(len(metrics) * 60) // Pre-allocate approximate space
@@ -1278,43 +1154,10 @@ func sendInfluxBatch(metrics []string, cfg *Config, verbose bool, stats *Graphit
         return
     }
 
-    if verbose {
-        log.Printf("Sent %d metrics to InfluxDB: %d flows (%.1f/%.1f PPS RX/TX, %.2f/%.2f Mbps RX/TX), %d IPs (%.1f/%.1f PPS RX/TX, %.2f/%.2f Mbps RX/TX)",
-            len(metrics), stats.FlowCount, stats.FlowPpsRx, stats.FlowPpsTx, stats.FlowMbpsRx, stats.FlowMbpsTx,
-            stats.IPCount, stats.IPPpsRx, stats.IPPpsTx, stats.IPMbpsRx, stats.IPMbpsTx)
+    if cfg.Verbose {
+        log.Printf("Sent %d metrics to InfluxDB", len(metrics))
     }
 }
-
-func displayStats(metrics []Metrics, now time.Time) {
-    sort.Slice(metrics, func(i, j int) bool {
-        return metrics[i].PpsRx+metrics[i].PpsTx > metrics[j].PpsRx+metrics[j].PpsTx
-    })
-
-    fmt.Printf("\n%s ---- Flow Statistics ----\n", now.Format("15:04:05"))
-
-    bannedMu.RLock()
-    if count := len(bannedIPs); count > 0 {
-        fmt.Printf("Banned IPs: %d\n", count)
-    }
-    bannedMu.RUnlock()
-
-    fmt.Printf("%-20s %-20s %8s %8s %8s %8s %6s\n",
-        "SRC IP", "DST IP", "PPS RX", "PPS TX", "Mbps RX", "Mbps TX", "STATUS")
-    fmt.Printf("%s\n", "---------------------------------------------------------------------")
-
-    for _, m := range metrics {
-        status := "OK"
-        if m.Banned {
-            status = "BAN"
-        }
-
-        fmt.Printf("%-20s %-20s %8.1f %8.1f %8.2f %8.2f %6s\n",
-            m.SrcIP, m.DstIP, m.PpsRx, m.PpsTx, m.MbpsRx, m.MbpsTx, status)
-    }
-    fmt.Printf("%s\n", "---------------------------------------------------------------------")
-}
-
-
 
 func u32ToIP(v uint32) net.IP {
     // IP addresses from eBPF are in network byte order, but we need to convert
