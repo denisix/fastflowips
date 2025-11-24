@@ -386,13 +386,27 @@ func checkExpiredBans(script string) {
 }
 
 func meetsFlowThresholds(ppsRx, ppsTx, mbpsRx, mbpsTx float64, cfg *Config) bool {
-	return (cfg.MinFlowPps <= 0 || ppsRx >= cfg.MinFlowPps || ppsTx >= cfg.MinFlowPps) &&
-		(cfg.MinFlowMbps <= 0 || mbpsRx >= cfg.MinFlowMbps || mbpsTx >= cfg.MinFlowMbps)
+	totalPps := ppsRx + ppsTx
+	totalMbps := mbpsRx + mbpsTx
+
+	if totalPps == 0 && totalMbps == 0 {
+		return false
+	}
+
+	return (cfg.MinFlowPps <= 0 || totalPps >= cfg.MinFlowPps) &&
+		(cfg.MinFlowMbps <= 0 || totalMbps >= cfg.MinFlowMbps)
 }
 
 func meetsIPThresholds(ppsRx, ppsTx, mbpsRx, mbpsTx float64, cfg *Config) bool {
-	return (cfg.MinIPsPps <= 0 || ppsRx >= cfg.MinIPsPps || ppsTx >= cfg.MinIPsPps) &&
-		(cfg.MinIPsMbps <= 0 || mbpsRx >= cfg.MinIPsMbps || mbpsTx >= cfg.MinIPsMbps)
+	totalPps := ppsRx + ppsTx
+	totalMbps := mbpsRx + mbpsTx
+
+	if totalPps == 0 && totalMbps == 0 {
+		return false
+	}
+
+	return (cfg.MinIPsPps <= 0 || totalPps >= cfg.MinIPsPps) &&
+		(cfg.MinIPsMbps <= 0 || totalMbps >= cfg.MinIPsMbps)
 }
 
 func parseFlags() *Config {
@@ -944,18 +958,12 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 		base := "fastflowips.flows." + srcSan + "_to_" + dstSan
 
 		// eBPF provides correct RX/TX values
-		if cfg.MinFlowPps == 0 || flow.ppsRx >= cfg.MinFlowPps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", base, flow.ppsRx, timestamp))
-		}
-		if cfg.MinFlowPps == 0 || flow.ppsTx >= cfg.MinFlowPps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.tx %.6f %d", base, flow.ppsTx, timestamp))
-		}
-		if cfg.MinFlowMbps == 0 || flow.mbpsRx >= cfg.MinFlowMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.rx %.6f %d", base, flow.mbpsRx, timestamp))
-		}
-		if cfg.MinFlowMbps == 0 || flow.mbpsTx >= cfg.MinFlowMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.tx %.6f %d", base, flow.mbpsTx, timestamp))
-		}
+		gMetrics = append(gMetrics,
+			fmt.Sprintf("%s.pps.rx %.6f %d", base, flow.ppsRx, timestamp),
+			fmt.Sprintf("%s.pps.tx %.6f %d", base, flow.ppsTx, timestamp),
+			fmt.Sprintf("%s.mbps.rx %.6f %d", base, flow.mbpsRx, timestamp),
+			fmt.Sprintf("%s.mbps.tx %.6f %d", base, flow.mbpsTx, timestamp),
+		)
 	}
 
 	for ip, stats := range ipStats {
@@ -966,18 +974,12 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 		ipSan := sanitizeIP(ip)
 		baseIP := "fastflowips.ips." + ipSan
 
-		if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", baseIP, stats.ppsRx, timestamp))
-		}
-		if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.tx %.6f %d", baseIP, stats.ppsTx, timestamp))
-		}
-		if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.rx %.6f %d", baseIP, stats.mbpsRx, timestamp))
-		}
-		if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.tx %.6f %d", baseIP, stats.mbpsTx, timestamp))
-		}
+		gMetrics = append(gMetrics,
+			fmt.Sprintf("%s.pps.rx %.6f %d", baseIP, stats.ppsRx, timestamp),
+			fmt.Sprintf("%s.pps.tx %.6f %d", baseIP, stats.ppsTx, timestamp),
+			fmt.Sprintf("%s.mbps.rx %.6f %d", baseIP, stats.mbpsRx, timestamp),
+			fmt.Sprintf("%s.mbps.tx %.6f %d", baseIP, stats.mbpsTx, timestamp),
+		)
 	}
 
 	if len(gMetrics) > 0 {
@@ -998,18 +1000,12 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		dstSan := sanitizeIP(flow.getDstIP())
 
 		// eBPF provides correct RX/TX values
-		if cfg.MinFlowPps == 0 || flow.ppsRx >= cfg.MinFlowPps {
-			gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=rx value=%.6f %s", srcSan, dstSan, flow.ppsRx, ts))
-		}
-		if cfg.MinFlowPps == 0 || flow.ppsTx >= cfg.MinFlowPps {
-			gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=tx value=%.6f %s", srcSan, dstSan, flow.ppsTx, ts))
-		}
-		if cfg.MinFlowMbps == 0 || flow.mbpsRx >= cfg.MinFlowMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=rx value=%.6f %s", srcSan, dstSan, flow.mbpsRx, ts))
-		}
-		if cfg.MinFlowMbps == 0 || flow.mbpsTx >= cfg.MinFlowMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=tx value=%.6f %s", srcSan, dstSan, flow.mbpsTx, ts))
-		}
+		gMetrics = append(gMetrics,
+			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=rx value=%.6f %s", srcSan, dstSan, flow.ppsRx, ts),
+			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=tx value=%.6f %s", srcSan, dstSan, flow.ppsTx, ts),
+			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=rx value=%.6f %s", srcSan, dstSan, flow.mbpsRx, ts),
+			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=tx value=%.6f %s", srcSan, dstSan, flow.mbpsTx, ts),
+		)
 	}
 
 	for ip, stats := range ipStats {
@@ -1020,18 +1016,12 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		ipSan := sanitizeIP(ip)
 		base := "fastflowips_ips,ip=" + ipSan + ",type=%s,direction=%s value=%.6f " + ts
 
-		if cfg.MinIPsPps == 0 || stats.ppsRx >= cfg.MinIPsPps {
-			gMetrics = append(gMetrics, fmt.Sprintf(base, "pps", "rx", stats.ppsRx))
-		}
-		if cfg.MinIPsPps == 0 || stats.ppsTx >= cfg.MinIPsPps {
-			gMetrics = append(gMetrics, fmt.Sprintf(base, "pps", "tx", stats.ppsTx))
-		}
-		if cfg.MinIPsMbps == 0 || stats.mbpsRx >= cfg.MinIPsMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf(base, "mbps", "rx", stats.mbpsRx))
-		}
-		if cfg.MinIPsMbps == 0 || stats.mbpsTx >= cfg.MinIPsMbps {
-			gMetrics = append(gMetrics, fmt.Sprintf(base, "mbps", "tx", stats.mbpsTx))
-		}
+		gMetrics = append(gMetrics,
+			fmt.Sprintf(base, "pps", "rx", stats.ppsRx),
+			fmt.Sprintf(base, "pps", "tx", stats.ppsTx),
+			fmt.Sprintf(base, "mbps", "rx", stats.mbpsRx),
+			fmt.Sprintf(base, "mbps", "tx", stats.mbpsTx),
+		)
 	}
 
 	if len(gMetrics) > 0 {

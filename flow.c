@@ -18,6 +18,7 @@ struct flow_stats {
     __u64 last_seen;
     __u8 src_monitored;
     __u8 dst_monitored;
+    __u8 pad[6];
 };
 
 struct network {
@@ -46,7 +47,7 @@ struct {
     __type(value, __u32);  // Number of configured networks (0 = disabled)
 } network_count SEC(".maps");
 
-static __always_inline int is_ip_in_networks(__u32 ip)
+static __always_inline __u32 get_network_count(void)
 {
     __u32 count_key = 0;
     __u32 *count_ptr = bpf_map_lookup_elem(&network_count, &count_key);
@@ -54,20 +55,32 @@ static __always_inline int is_ip_in_networks(__u32 ip)
         return 0;
 
     __u32 count = *count_ptr;
-    if (count == 0)
-        return 1; // No networks configured = monitor all traffic
     if (count > 32)
         count = 32;
+    return count;
+}
 
-    int matched = 0;
+static __always_inline void match_ips_to_networks(__u32 src_ip, __u32 dst_ip,
+                                                 __u32 count,
+                                                 int *src_monitored,
+                                                 int *dst_monitored)
+{
+    int src_match = 0;
+    int dst_match = 0;
 
 #define CHECK_NETWORK(idx)                                                     \
     do {                                                                       \
-        if (!matched && count > (idx)) {                                       \
+        if ((src_match == 0 || dst_match == 0) && count > (idx)) {              \
             __u32 key = (idx);                                                 \
             struct network *net = bpf_map_lookup_elem(&monitored_networks, &key); \
-            if (net && (ip & net->mask) == net->addr)                          \
-                matched = 1;                                                   \
+            if (net) {                                                         \
+                __u32 mask = net->mask;                                        \
+                __u32 addr = net->addr;                                        \
+                if (!src_match && (src_ip & mask) == addr)                     \
+                    src_match = 1;                                             \
+                if (!dst_match && (dst_ip & mask) == addr)                     \
+                    dst_match = 1;                                             \
+            }                                                                  \
         }                                                                      \
     } while (0)
 
@@ -106,7 +119,8 @@ static __always_inline int is_ip_in_networks(__u32 ip)
 
 #undef CHECK_NETWORK
 
-    return matched;
+    *src_monitored = src_match;
+    *dst_monitored = dst_match;
 }
 
 static __always_inline int handle_ipv4(void *data, void *data_end, int is_egress)
@@ -131,11 +145,18 @@ static __always_inline int handle_ipv4(void *data, void *data_end, int is_egress
     __u32 src_ip_host = bpf_ntohl(src_ip);
     __u32 dst_ip_host = bpf_ntohl(dst_ip);
 
-    int src_monitored = is_ip_in_networks(src_ip_host);
-    int dst_monitored = is_ip_in_networks(dst_ip_host);
+    __u32 monitored_count = get_network_count();
+    int src_monitored = 1;
+    int dst_monitored = 1;
 
-    if (!src_monitored && !dst_monitored)
-        return 0; // Ignore flows outside configured networks
+    if (monitored_count != 0) {
+        src_monitored = 0;
+        dst_monitored = 0;
+        match_ips_to_networks(src_ip_host, dst_ip_host, monitored_count,
+                              &src_monitored, &dst_monitored);
+        if (!src_monitored && !dst_monitored)
+            return 0; // Ignore flows outside configured networks
+    }
 
     struct flow_key k = {
         .src = src_ip,
