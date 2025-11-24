@@ -61,15 +61,51 @@ static __always_inline int is_ip_in_networks(__u32 ip)
 
     int matched = 0;
 
-#pragma unroll
-    for (__u32 i = 0; i < 32; i++) {
-        if (i >= count || matched)
-            continue;
+#define CHECK_NETWORK(idx)                                                     \
+    do {                                                                       \
+        if (!matched && count > (idx)) {                                       \
+            __u32 key = (idx);                                                 \
+            struct network *net = bpf_map_lookup_elem(&monitored_networks, &key); \
+            if (net && (ip & net->mask) == net->addr)                          \
+                matched = 1;                                                   \
+        }                                                                      \
+    } while (0)
 
-        struct network *net = bpf_map_lookup_elem(&monitored_networks, &i);
-        if (net && (ip & net->mask) == net->addr)
-            matched = 1;
-    }
+    CHECK_NETWORK(0);
+    CHECK_NETWORK(1);
+    CHECK_NETWORK(2);
+    CHECK_NETWORK(3);
+    CHECK_NETWORK(4);
+    CHECK_NETWORK(5);
+    CHECK_NETWORK(6);
+    CHECK_NETWORK(7);
+    CHECK_NETWORK(8);
+    CHECK_NETWORK(9);
+    CHECK_NETWORK(10);
+    CHECK_NETWORK(11);
+    CHECK_NETWORK(12);
+    CHECK_NETWORK(13);
+    CHECK_NETWORK(14);
+    CHECK_NETWORK(15);
+    CHECK_NETWORK(16);
+    CHECK_NETWORK(17);
+    CHECK_NETWORK(18);
+    CHECK_NETWORK(19);
+    CHECK_NETWORK(20);
+    CHECK_NETWORK(21);
+    CHECK_NETWORK(22);
+    CHECK_NETWORK(23);
+    CHECK_NETWORK(24);
+    CHECK_NETWORK(25);
+    CHECK_NETWORK(26);
+    CHECK_NETWORK(27);
+    CHECK_NETWORK(28);
+    CHECK_NETWORK(29);
+    CHECK_NETWORK(30);
+    CHECK_NETWORK(31);
+
+#undef CHECK_NETWORK
+
     return matched;
 }
 
