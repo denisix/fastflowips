@@ -851,20 +851,16 @@ func aggregateIPStats(flows []FlowData, cfg *Config) IPStatsMap {
 	for _, flow := range flows {
 		// If no networks configured, aggregate both IPs (legacy behavior)
 		if len(cfg.AllowedNets) == 0 {
-			srcIP := flow.getSrcIP()
-			dstIP := flow.getDstIP()
-			ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
-			ipStats.addStats(dstIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+			ipStats.addStats(flow.getSrcIP(), flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+			ipStats.addStats(flow.getDstIP(), flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
 		} else {
 			// Only aggregate stats for IPs that belong to monitored networks
 			if flow.srcMonitored {
-				srcIP := flow.getSrcIP()
-				ipStats.addStats(srcIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+				ipStats.addStats(flow.getSrcIP(), flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
 			}
 
 			if flow.dstMonitored {
-				dstIP := flow.getDstIP()
-				ipStats.addStats(dstIP, flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
+				ipStats.addStats(flow.getDstIP(), flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx)
 			}
 		}
 	}
@@ -955,14 +951,13 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 
 		srcSan := sanitizeIP(flow.getSrcIP())
 		dstSan := sanitizeIP(flow.getDstIP())
-		base := "fastflowips.flows." + srcSan + "_to_" + dstSan
 
 		// eBPF provides correct RX/TX values
 		gMetrics = append(gMetrics,
-			fmt.Sprintf("%s.pps.rx %.6f %d", base, flow.ppsRx, timestamp),
-			fmt.Sprintf("%s.pps.tx %.6f %d", base, flow.ppsTx, timestamp),
-			fmt.Sprintf("%s.mbps.rx %.6f %d", base, flow.mbpsRx, timestamp),
-			fmt.Sprintf("%s.mbps.tx %.6f %d", base, flow.mbpsTx, timestamp),
+			fmt.Sprintf("fastflowips.flows.%s_to_%s.pps.rx %.6f %d", dstSan, srcSan, flow.ppsRx, timestamp),
+			fmt.Sprintf("fastflowips.flows.%s_to_%s.pps.tx %.6f %d", srcSan, dstSan, flow.ppsTx, timestamp),
+			fmt.Sprintf("fastflowips.flows.%s_to_%s.mbps.rx %.6f %d", dstSan, srcSan, flow.mbpsRx, timestamp),
+			fmt.Sprintf("fastflowips.flows.%s_to_%s.mbps.tx %.6f %d", srcSan, dstSan, flow.mbpsTx, timestamp),
 		)
 	}
 
@@ -972,13 +967,12 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 		}
 
 		ipSan := sanitizeIP(ip)
-		baseIP := "fastflowips.ips." + ipSan
 
 		gMetrics = append(gMetrics,
-			fmt.Sprintf("%s.pps.rx %.6f %d", baseIP, stats.ppsRx, timestamp),
-			fmt.Sprintf("%s.pps.tx %.6f %d", baseIP, stats.ppsTx, timestamp),
-			fmt.Sprintf("%s.mbps.rx %.6f %d", baseIP, stats.mbpsRx, timestamp),
-			fmt.Sprintf("%s.mbps.tx %.6f %d", baseIP, stats.mbpsTx, timestamp),
+			fmt.Sprintf("fastflowips.ips.%s.pps.rx %.6f %d", ipSan, stats.ppsRx, timestamp),
+			fmt.Sprintf("fastflowips.ips.%s.pps.tx %.6f %d", ipSan, stats.ppsTx, timestamp),
+			fmt.Sprintf("fastflowips.ips.%s.mbps.rx %.6f %d", ipSan, stats.mbpsRx, timestamp),
+			fmt.Sprintf("fastflowips.ips.%s.mbps.tx %.6f %d", ipSan, stats.mbpsTx, timestamp),
 		)
 	}
 
@@ -1014,13 +1008,12 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		}
 
 		ipSan := sanitizeIP(ip)
-		base := "fastflowips_ips,ip=" + ipSan + ",type=%s,direction=%s value=%.6f " + ts
 
 		gMetrics = append(gMetrics,
-			fmt.Sprintf(base, "pps", "rx", stats.ppsRx),
-			fmt.Sprintf(base, "pps", "tx", stats.ppsTx),
-			fmt.Sprintf(base, "mbps", "rx", stats.mbpsRx),
-			fmt.Sprintf(base, "mbps", "tx", stats.mbpsTx),
+			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "pps", "rx", stats.ppsRx, ts),
+			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "pps", "tx", stats.ppsTx, ts),
+			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "mbps", "rx", stats.mbpsRx, ts),
+			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "mbps", "tx", stats.mbpsTx, ts),
 		)
 	}
 
