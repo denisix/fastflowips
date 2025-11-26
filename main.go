@@ -43,6 +43,17 @@ type FlowStats struct {
 	Pad          [6]byte // Padding to match eBPF struct alignment
 }
 
+type prefixKey struct {
+	Prefix   uint32
+	MaskBits uint8
+	Pad      [3]byte
+}
+
+const (
+	bloomWordCount = 64
+	bloomBitCount  = bloomWordCount * 32
+)
+
 type Metrics struct {
 	srcIP, dstIP                 string
 	ppsRx, ppsTx, mbpsRx, mbpsTx float64
@@ -475,9 +486,19 @@ func parseFlags() *Config {
 }
 
 func populateNetworksMap(coll *ebpf.Collection, allowedNets []*net.IPNet) error {
-	networksMap := coll.Maps["monitored_networks"]
-	if networksMap == nil {
-		return fmt.Errorf("BPF map 'monitored_networks' not found")
+	prefixMap := coll.Maps["monitored_prefixes"]
+	if prefixMap == nil {
+		return fmt.Errorf("BPF map 'monitored_prefixes' not found")
+	}
+
+	bloomMap := coll.Maps["monitored_bloom"]
+	if bloomMap == nil {
+		return fmt.Errorf("BPF map 'monitored_bloom' not found")
+	}
+
+	maskMap := coll.Maps["mask_bitmap"]
+	if maskMap == nil {
+		return fmt.Errorf("BPF map 'mask_bitmap' not found")
 	}
 
 	countMap := coll.Maps["network_count"]
@@ -485,54 +506,82 @@ func populateNetworksMap(coll *ebpf.Collection, allowedNets []*net.IPNet) error 
 		return fmt.Errorf("BPF map 'network_count' not found")
 	}
 
-	// Set network count for optimization
 	countKey := uint32(0)
 	networkCount := uint32(len(allowedNets))
 	if err := countMap.Put(countKey, networkCount); err != nil {
 		return fmt.Errorf("failed to set network count: %v", err)
 	}
 
-	// Clear the networks map first
-	for i := 0; i < 32; i++ {
-		key := uint32(i)
-		emptyNet := struct {
-			Addr uint32
-			Mask uint32
-		}{0, 0}
-		networksMap.Put(key, emptyNet)
+	var maskBitmap uint32
+	bloomWords := make([]uint32, bloomWordCount)
+
+	for _, ipnet := range allowedNets {
+		ip := ipnet.IP.To4()
+		if ip == nil {
+			continue // IPv6 not supported in eBPF filter
+		}
+
+		ones, bits := ipnet.Mask.Size()
+		if bits != 32 || ones <= 0 || ones > 32 {
+			log.Printf("Skipping unsupported network mask: %s", ipnet.String())
+			continue
+		}
+
+		maskBits := uint8(ones)
+		maskBitmap |= 1 << (maskBits - 1)
+
+		netAddr := binary.BigEndian.Uint32(ip)
+		netMask := binary.BigEndian.Uint32(ipnet.Mask)
+		prefix := netAddr & netMask
+
+		key := prefixKey{Prefix: prefix, MaskBits: maskBits}
+		var present uint8 = 1
+		if err := prefixMap.Put(key, present); err != nil {
+			return fmt.Errorf("failed to update prefix map: %v", err)
+		}
+
+		setBloomBits(bloomWords, prefix, maskBits)
+
+		log.Printf("eBPF network filter: %s (prefix=0x%08x, mask=%d)", ipnet.String(), prefix, maskBits)
 	}
 
-	// Populate with actual networks
-	for i, ipnet := range allowedNets {
-		if i >= 32 {
-			log.Printf("Warning: Only first 32 networks will be used in eBPF filter")
-			break
-		}
+	// Write mask bitmap
+	if err := maskMap.Put(countKey, maskBitmap); err != nil {
+		return fmt.Errorf("failed to update mask bitmap: %v", err)
+	}
 
+	// Update bloom filter words
+	for i := 0; i < bloomWordCount; i++ {
 		key := uint32(i)
-		netAddr := binary.BigEndian.Uint32(ipnet.IP.To4())
-		netMask := binary.BigEndian.Uint32(ipnet.Mask)
-
-		network := struct {
-			Addr uint32
-			Mask uint32
-		}{
-			Addr: netAddr & netMask, // Apply mask to get network address
-			Mask: netMask,
-		}
-
-		if err := networksMap.Put(key, network); err != nil {
-			return fmt.Errorf("failed to update network %d: %v", i, err)
-		}
-
-		if log.Printf != nil {
-			log.Printf("eBPF network filter: %s (addr=0x%08x, mask=0x%08x)",
-				ipnet.String(), network.Addr, network.Mask)
+		if err := bloomMap.Put(key, bloomWords[i]); err != nil {
+			return fmt.Errorf("failed to update bloom word %d: %v", i, err)
 		}
 	}
 
 	log.Printf("eBPF optimization: network_count=%d", networkCount)
 	return nil
+}
+
+func setBloomBits(words []uint32, prefix uint32, maskBits uint8) {
+	bit1, bit2 := bloomHashes(prefix, maskBits)
+	words[bit1>>5] |= 1 << (bit1 & 31)
+	words[bit2>>5] |= 1 << (bit2 & 31)
+}
+
+func bloomHashes(prefix uint32, maskBits uint8) (uint32, uint32) {
+	seed := prefix ^ (uint32(maskBits) << 26)
+	h1 := mixHash(seed ^ 0x9747b28c)
+	h2 := mixHash(seed ^ 0x9e3779b9)
+	return h1 & (bloomBitCount - 1), h2 & (bloomBitCount - 1)
+}
+
+func mixHash(v uint32) uint32 {
+	v ^= v >> 16
+	v *= 0x7feb352d
+	v ^= v >> 15
+	v *= 0x846ca68b
+	v ^= v >> 16
+	return v
 }
 
 func main() {
@@ -951,14 +1000,20 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 
 		srcSan := sanitizeIP(flow.getSrcIP())
 		dstSan := sanitizeIP(flow.getDstIP())
+		base := "fastflowips.flows." + srcSan + "_to_" + dstSan
 
-		// eBPF provides correct RX/TX values
-		gMetrics = append(gMetrics,
-			fmt.Sprintf("fastflowips.flows.%s_to_%s.pps.rx %.6f %d", dstSan, srcSan, flow.ppsRx, timestamp),
-			fmt.Sprintf("fastflowips.flows.%s_to_%s.pps.tx %.6f %d", srcSan, dstSan, flow.ppsTx, timestamp),
-			fmt.Sprintf("fastflowips.flows.%s_to_%s.mbps.rx %.6f %d", dstSan, srcSan, flow.mbpsRx, timestamp),
-			fmt.Sprintf("fastflowips.flows.%s_to_%s.mbps.tx %.6f %d", srcSan, dstSan, flow.mbpsTx, timestamp),
-		)
+		if flow.ppsRx > 0 && (cfg.MinFlowPps <= 0 || flow.ppsRx >= cfg.MinFlowPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", base, flow.ppsRx, timestamp))
+		}
+		if flow.ppsTx > 0 && (cfg.MinFlowPps <= 0 || flow.ppsTx >= cfg.MinFlowPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.tx %.6f %d", base, flow.ppsTx, timestamp))
+		}
+		if flow.mbpsRx > 0 && (cfg.MinFlowMbps <= 0 || flow.mbpsRx >= cfg.MinFlowMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.rx %.6f %d", base, flow.mbpsRx, timestamp))
+		}
+		if flow.mbpsTx > 0 && (cfg.MinFlowMbps <= 0 || flow.mbpsTx >= cfg.MinFlowMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.tx %.6f %d", base, flow.mbpsTx, timestamp))
+		}
 	}
 
 	for ip, stats := range ipStats {
@@ -967,13 +1022,20 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 		}
 
 		ipSan := sanitizeIP(ip)
+		baseIP := "fastflowips.ips." + ipSan
 
-		gMetrics = append(gMetrics,
-			fmt.Sprintf("fastflowips.ips.%s.pps.rx %.6f %d", ipSan, stats.ppsRx, timestamp),
-			fmt.Sprintf("fastflowips.ips.%s.pps.tx %.6f %d", ipSan, stats.ppsTx, timestamp),
-			fmt.Sprintf("fastflowips.ips.%s.mbps.rx %.6f %d", ipSan, stats.mbpsRx, timestamp),
-			fmt.Sprintf("fastflowips.ips.%s.mbps.tx %.6f %d", ipSan, stats.mbpsTx, timestamp),
-		)
+		if stats.ppsRx > 0 && (cfg.MinIPsPps <= 0 || stats.ppsRx >= cfg.MinIPsPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", baseIP, stats.ppsRx, timestamp))
+		}
+		if stats.ppsTx > 0 && (cfg.MinIPsPps <= 0 || stats.ppsTx >= cfg.MinIPsPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.tx %.6f %d", baseIP, stats.ppsTx, timestamp))
+		}
+		if stats.mbpsRx > 0 && (cfg.MinIPsMbps <= 0 || stats.mbpsRx >= cfg.MinIPsMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.rx %.6f %d", baseIP, stats.mbpsRx, timestamp))
+		}
+		if stats.mbpsTx > 0 && (cfg.MinIPsMbps <= 0 || stats.mbpsTx >= cfg.MinIPsMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s.mbps.tx %.6f %d", baseIP, stats.mbpsTx, timestamp))
+		}
 	}
 
 	if len(gMetrics) > 0 {
@@ -993,13 +1055,20 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		srcSan := sanitizeIP(flow.getSrcIP())
 		dstSan := sanitizeIP(flow.getDstIP())
 
-		// eBPF provides correct RX/TX values
-		gMetrics = append(gMetrics,
-			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=rx value=%.6f %s", srcSan, dstSan, flow.ppsRx, ts),
-			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=pps,direction=tx value=%.6f %s", srcSan, dstSan, flow.ppsTx, ts),
-			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=rx value=%.6f %s", srcSan, dstSan, flow.mbpsRx, ts),
-			fmt.Sprintf("fastflowips_flows,src=%s,dst=%s,type=mbps,direction=tx value=%.6f %s", srcSan, dstSan, flow.mbpsTx, ts),
-		)
+		base := fmt.Sprintf("fastflowips_flows,src=%s,dst=%s", srcSan, dstSan)
+
+		if flow.ppsRx > 0 && (cfg.MinFlowPps <= 0 || flow.ppsRx >= cfg.MinFlowPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=pps,direction=rx value=%.6f %s", base, flow.ppsRx, ts))
+		}
+		if flow.ppsTx > 0 && (cfg.MinFlowPps <= 0 || flow.ppsTx >= cfg.MinFlowPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=pps,direction=tx value=%.6f %s", base, flow.ppsTx, ts))
+		}
+		if flow.mbpsRx > 0 && (cfg.MinFlowMbps <= 0 || flow.mbpsRx >= cfg.MinFlowMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=mbps,direction=rx value=%.6f %s", base, flow.mbpsRx, ts))
+		}
+		if flow.mbpsTx > 0 && (cfg.MinFlowMbps <= 0 || flow.mbpsTx >= cfg.MinFlowMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=mbps,direction=tx value=%.6f %s", base, flow.mbpsTx, ts))
+		}
 	}
 
 	for ip, stats := range ipStats {
@@ -1008,13 +1077,20 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		}
 
 		ipSan := sanitizeIP(ip)
+		base := fmt.Sprintf("fastflowips_ips,ip=%s", ipSan)
 
-		gMetrics = append(gMetrics,
-			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "pps", "rx", stats.ppsRx, ts),
-			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "pps", "tx", stats.ppsTx, ts),
-			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "mbps", "rx", stats.mbpsRx, ts),
-			fmt.Sprintf("fastflowips_ips,ip=%s,type=%s,direction=%s value=%.6f %s", ipSan, "mbps", "tx", stats.mbpsTx, ts),
-		)
+		if stats.ppsRx > 0 && (cfg.MinIPsPps <= 0 || stats.ppsRx >= cfg.MinIPsPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=pps,direction=rx value=%.6f %s", base, stats.ppsRx, ts))
+		}
+		if stats.ppsTx > 0 && (cfg.MinIPsPps <= 0 || stats.ppsTx >= cfg.MinIPsPps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=pps,direction=tx value=%.6f %s", base, stats.ppsTx, ts))
+		}
+		if stats.mbpsRx > 0 && (cfg.MinIPsMbps <= 0 || stats.mbpsRx >= cfg.MinIPsMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=mbps,direction=rx value=%.6f %s", base, stats.mbpsRx, ts))
+		}
+		if stats.mbpsTx > 0 && (cfg.MinIPsMbps <= 0 || stats.mbpsTx >= cfg.MinIPsMbps) {
+			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=mbps,direction=tx value=%.6f %s", base, stats.mbpsTx, ts))
+		}
 	}
 
 	if len(gMetrics) > 0 {
