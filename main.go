@@ -116,8 +116,10 @@ type Config struct {
 	MinIPsPps   float64
 	MinIPsMbps  float64
 	// Performance settings
-	IPCacheSize int
-	DebugFlows  bool
+	IPCacheSize       int
+	DebugFlows        bool
+	MetricInstance    string
+	MetricUseHostname bool
 }
 
 type Ban struct {
@@ -130,6 +132,19 @@ func sanitizeIP(ip string) string {
 		return strings.ReplaceAll(ip, ".", "_")
 	}
 	return ip // IPv6 or already sanitized
+}
+
+func sanitizeInstance(name string) string {
+	name = strings.ToLower(name)
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 func parseNetworks(networks string) ([]*net.IPNet, error) {
@@ -456,6 +471,8 @@ func parseFlags() *Config {
 	// Performance settings
 	flag.IntVar(&config.IPCacheSize, "ip-cache-size", 100000, "Maximum IP cache size before clearing (legacy option, no longer used)")
 	flag.BoolVar(&config.DebugFlows, "debug-flows", false, "Log raw eBPF flow entries and computed metrics each interval")
+	flag.BoolVar(&config.MetricUseHostname, "metric-instance-hostname", false, "Use system hostname as metric instance prefix")
+	flag.StringVar(&config.MetricInstance, "metric-instance", "", "Custom metric instance prefix to isolate metrics per node")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
@@ -480,6 +497,17 @@ func parseFlags() *Config {
 			log.Fatalf("Error parsing networks: %v", err)
 		}
 		config.AllowedNets = nets
+	}
+
+	if config.MetricInstance == "" && config.MetricUseHostname {
+		if host, err := os.Hostname(); err == nil {
+			config.MetricInstance = host
+		} else {
+			log.Printf("Failed to read hostname for metric instance: %v", err)
+		}
+	}
+	if config.MetricInstance != "" {
+		config.MetricInstance = sanitizeInstance(config.MetricInstance)
 	}
 
 	return config
@@ -992,6 +1020,10 @@ func generateDisplayMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config) {
 
 func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, timestamp int64) {
 	var gMetrics []string
+	root := "fastflowips"
+	if cfg.MetricInstance != "" {
+		root = "fastflowips." + cfg.MetricInstance
+	}
 
 	for _, flow := range flows {
 		if !meetsFlowThresholds(flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx, cfg) {
@@ -1000,7 +1032,7 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 
 		srcSan := sanitizeIP(flow.getSrcIP())
 		dstSan := sanitizeIP(flow.getDstIP())
-		base := "fastflowips.flows." + srcSan + "_to_" + dstSan
+		base := root + ".flows." + srcSan + "_to_" + dstSan
 
 		if flow.ppsRx > 0 && (cfg.MinFlowPps <= 0 || flow.ppsRx >= cfg.MinFlowPps) {
 			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", base, flow.ppsRx, timestamp))
@@ -1022,7 +1054,7 @@ func generateGraphiteMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, 
 		}
 
 		ipSan := sanitizeIP(ip)
-		baseIP := "fastflowips.ips." + ipSan
+		baseIP := root + ".ips." + ipSan
 
 		if stats.ppsRx > 0 && (cfg.MinIPsPps <= 0 || stats.ppsRx >= cfg.MinIPsPps) {
 			gMetrics = append(gMetrics, fmt.Sprintf("%s.pps.rx %.6f %d", baseIP, stats.ppsRx, timestamp))
@@ -1047,6 +1079,11 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 	var gMetrics []string
 	ts := fmt.Sprintf("%d", timestamp*1000000000)
 
+	instance := ""
+	if cfg.MetricInstance != "" {
+		instance = ",instance=" + cfg.MetricInstance
+	}
+
 	for _, flow := range flows {
 		if !meetsFlowThresholds(flow.ppsRx, flow.ppsTx, flow.mbpsRx, flow.mbpsTx, cfg) {
 			continue
@@ -1055,8 +1092,7 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		srcSan := sanitizeIP(flow.getSrcIP())
 		dstSan := sanitizeIP(flow.getDstIP())
 
-		base := fmt.Sprintf("fastflowips_flows,src=%s,dst=%s", srcSan, dstSan)
-
+		base := fmt.Sprintf("fastflowips_flows,src=%s,dst=%s%s", srcSan, dstSan, instance)
 		if flow.ppsRx > 0 && (cfg.MinFlowPps <= 0 || flow.ppsRx >= cfg.MinFlowPps) {
 			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=pps,direction=rx value=%.6f %s", base, flow.ppsRx, ts))
 		}
@@ -1077,7 +1113,7 @@ func generateInfluxMetrics(flows []FlowData, ipStats IPStatsMap, cfg *Config, ti
 		}
 
 		ipSan := sanitizeIP(ip)
-		base := fmt.Sprintf("fastflowips_ips,ip=%s", ipSan)
+		base := fmt.Sprintf("fastflowips_ips,ip=%s%s", ipSan, instance)
 
 		if stats.ppsRx > 0 && (cfg.MinIPsPps <= 0 || stats.ppsRx >= cfg.MinIPsPps) {
 			gMetrics = append(gMetrics, fmt.Sprintf("%s,type=pps,direction=rx value=%.6f %s", base, stats.ppsRx, ts))
