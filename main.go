@@ -362,13 +362,18 @@ WantedBy=multi-user.target
 }
 
 func runScript(script, action, ip string) {
-	if script != "" {
-		go func() {
-			if err := exec.Command(script, action, ip).Run(); err != nil {
-				log.Printf("%s script error for %s: %v", action, ip, err)
-			}
-		}()
+	if script == "" {
+		return
 	}
+
+	go func() {
+		cmd := exec.Command(script, action, ip)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("%s script error for %s: %v (output: %s)", action, ip, err, strings.TrimSpace(string(output)))
+		} else if len(output) > 0 {
+			log.Printf("%s script output for %s: %s", action, ip, strings.TrimSpace(string(output)))
+		}
+	}()
 }
 
 func banIP(ip string, duration time.Duration, script string, ppsRx, ppsTx, mbpsRx, mbpsTx float64) {
