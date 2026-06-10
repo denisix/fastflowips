@@ -41,7 +41,7 @@ Requires root for eBPF attachment.
 
 **Performance**: Optimized for high-traffic networks. 75% fewer mutex operations, 60% faster string processing than typical implementations.
 
-**Flexible monitoring**: Track specific networks with `-networks "10.0.0.0/8"` or monitor everything.
+**Flexible monitoring**: Track specific networks with `-networks "10.0.0.0/8 2001:db8::/32"` (IPv4 and IPv6) or monitor everything.
 
 **Smart filtering**: Only export meaningful metrics to Graphite with `-min-flow-pps` and `-min-ips-pps`.
 
@@ -59,7 +59,7 @@ Requires root for eBPF attachment.
 -verbose                     # Detailed logging
 
 # Network filtering
--networks "192.168.1.0/24"   # Monitor specific networks only
+-networks "192.168.1.0/24 10.0.0.0/8 2001:db8::/32"  # Space-separated CIDRs, IPv4 + IPv6
 
 # IP banning thresholds
 -ban-pps-rx 1000            # Ban if receiving > 1000 PPS
@@ -92,12 +92,15 @@ When thresholds are exceeded, your script gets called:
 /path/to/script.sh unban 192.168.1.100  # Ban expired
 ```
 
-Example using iptables:
+The IP can be IPv4 or IPv6, so the script should handle both:
+
 ```bash
 #!/bin/bash
+ipt=iptables
+[[ $2 == *:* ]] && ipt=ip6tables
 case $1 in
-  ban)   iptables -I INPUT -s $2 -j DROP ;;
-  unban) iptables -D INPUT -s $2 -j DROP 2>/dev/null ;;
+  ban)   $ipt -I INPUT -s $2 -j DROP ;;
+  unban) $ipt -D INPUT -s $2 -j DROP 2>/dev/null ;;
 esac
 ```
 

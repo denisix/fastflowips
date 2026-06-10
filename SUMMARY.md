@@ -4,6 +4,7 @@
 eBPF-based tool for real-time per-IP traffic monitoring with dual metrics export (Graphite/InfluxDB) and threshold-based banning.
 
 ## Recent Updates
+- **IPv6 Support**: Unified 16-byte flow key (IPv4 stored as IPv4-mapped), IPv6 network filtering via eBPF LPM trie, IPv6-safe metric names and bans
 - **Flow Direction Fix**: Corrected RX/TX perspective for proper internal IP viewpoint in graphs
 - **Thread-Safe Connections**: Fixed Graphite connection race conditions preventing crashes
 - **Systemd Quoting**: Preserved argument quotes in service installation for multi-word parameters
@@ -25,7 +26,7 @@ eBPF-based tool for real-time per-IP traffic monitoring with dual metrics export
 -influx-url http://localhost:8086 -influx-db fastflowips -influx-user user -influx-pass pass
 
 # Monitoring
--interface eth0 -networks "192.168.1.0/24" -interval 5s -show-stats
+-interface eth0 -networks "192.168.1.0/24 2001:db8::/32" -interval 5s -show-stats
 
 # Banning
 -ban-pps-rx 1000 -ban-mbps-tx 100 -ban-time 5m -ban-script ./ban.sh

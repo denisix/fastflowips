@@ -27,9 +27,11 @@ import (
 //go:embed flow.o
 var embeddedBPF []byte
 
+// FlowKey mirrors struct flow_key in flow.c: 16-byte addresses in network
+// byte order; IPv4 is stored as IPv4-mapped IPv6 (::ffff:a.b.c.d).
 type FlowKey struct {
-	Src uint32
-	Dst uint32
+	Src [16]byte
+	Dst [16]byte
 }
 
 type FlowStats struct {
@@ -47,6 +49,12 @@ type prefixKey struct {
 	Prefix   uint32
 	MaskBits uint8
 	Pad      [3]byte
+}
+
+// lpmKeyV6 mirrors struct lpm_key6 in flow.c (LPM trie key, 20 bytes).
+type lpmKeyV6 struct {
+	Prefixlen uint32
+	Addr      [16]byte
 }
 
 const (
@@ -68,11 +76,17 @@ type FlowData struct {
 }
 
 func (f *FlowData) getSrcIP() string {
-	return u32ToIPString(f.key.Src)
+	return flowAddrToString(f.key.Src)
 }
 
 func (f *FlowData) getDstIP() string {
-	return u32ToIPString(f.key.Dst)
+	return flowAddrToString(f.key.Dst)
+}
+
+// flowAddrToString renders a 16-byte flow address; net.IP prints
+// IPv4-mapped addresses as dotted quad automatically.
+func flowAddrToString(addr [16]byte) string {
+	return net.IP(addr[:]).String()
 }
 
 var (
@@ -127,11 +141,11 @@ type Ban struct {
 	Duration time.Duration
 }
 
+var ipSanitizer = strings.NewReplacer(".", "_", ":", "_")
+
 func sanitizeIP(ip string) string {
-	if strings.Contains(ip, ".") {
-		return strings.ReplaceAll(ip, ".", "_")
-	}
-	return ip // IPv6 or already sanitized
+	// Graphite paths and Influx tags cannot contain '.' (IPv4) or ':' (IPv6)
+	return ipSanitizer.Replace(ip)
 }
 
 func sanitizeInstance(name string) string {
@@ -152,11 +166,12 @@ func parseNetworks(networks string) ([]*net.IPNet, error) {
 		return nil, nil
 	}
 
-	var nets []*net.IPNet
-	for _, network := range strings.Fields(networks) {
+	fields := strings.Fields(networks)
+	nets := make([]*net.IPNet, 0, len(fields))
+	for _, network := range fields {
 		_, ipnet, err := net.ParseCIDR(network)
 		if err != nil {
-			return nil, fmt.Errorf("invalid network %s: %v", network, err)
+			return nil, fmt.Errorf("invalid network %q: %w", network, err)
 		}
 		nets = append(nets, ipnet)
 	}
@@ -457,7 +472,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&config.ForceCleanup, "force-cleanup", false, "Force cleanup of existing eBPF filters on startup")
 	flag.BoolVar(&config.CleanupOnly, "cleanup-only", false, "Only cleanup existing filters and exit (no monitoring)")
 	flag.BoolVar(&config.Install, "install", false, "Install as systemd service using current arguments and exit")
-	flag.StringVar(&config.Networks, "networks", "", "Filter IPs to specific networks in CIDR notation (e.g., '192.168.1.0/24 10.0.0.0/8')")
+	flag.StringVar(&config.Networks, "networks", "", "Filter IPs to specific networks in CIDR notation, IPv4 and IPv6 (e.g., '192.168.1.0/24 10.0.0.0/8 2001:db8::/32')")
 
 	// Threshold and ban settings
 	flag.Float64Var(&config.BanPpsRx, "ban-pps-rx", 0, "PPS RX threshold for banning (0 = disabled)")
@@ -539,60 +554,114 @@ func populateNetworksMap(coll *ebpf.Collection, allowedNets []*net.IPNet) error 
 		return fmt.Errorf("BPF map 'network_count' not found")
 	}
 
+	prefix6Map := coll.Maps["monitored_prefixes6"]
+	if prefix6Map == nil {
+		return fmt.Errorf("BPF map 'monitored_prefixes6' not found")
+	}
+
+	data := buildNetworkFilterData(allowedNets)
+	if len(allowedNets) > 0 && len(data.entries) == 0 && len(data.entriesV6) == 0 {
+		return fmt.Errorf("no usable networks in filter (/0 is not supported by the eBPF filter)")
+	}
+
 	countKey := uint32(0)
-	networkCount := uint32(len(allowedNets))
+	networkCount := uint32(len(data.entries) + len(data.entriesV6))
 	if err := countMap.Put(countKey, networkCount); err != nil {
 		return fmt.Errorf("failed to set network count: %v", err)
 	}
 
-	var maskBitmap uint32
-	bloomWords := make([]uint32, bloomWordCount)
-
-	for _, ipnet := range allowedNets {
-		ip := ipnet.IP.To4()
-		if ip == nil {
-			continue // IPv6 not supported in eBPF filter
-		}
-
-		ones, bits := ipnet.Mask.Size()
-		if bits != 32 || ones <= 0 || ones > 32 {
-			log.Printf("Skipping unsupported network mask: %s", ipnet.String())
-			continue
-		}
-
-		maskBits := uint8(ones)
-		maskBitmap |= 1 << (maskBits - 1)
-
-		netAddr := binary.BigEndian.Uint32(ip)
-		netMask := binary.BigEndian.Uint32(ipnet.Mask)
-		prefix := netAddr & netMask
-
-		key := prefixKey{Prefix: prefix, MaskBits: maskBits}
-		var present uint8 = 1
+	var present uint8 = 1
+	for _, key := range data.entries {
 		if err := prefixMap.Put(key, present); err != nil {
 			return fmt.Errorf("failed to update prefix map: %v", err)
 		}
+		log.Printf("eBPF network filter: prefix=0x%08x, mask=%d", key.Prefix, key.MaskBits)
+	}
 
-		setBloomBits(bloomWords, prefix, maskBits)
-
-		log.Printf("eBPF network filter: %s (prefix=0x%08x, mask=%d)", ipnet.String(), prefix, maskBits)
+	for _, key := range data.entriesV6 {
+		if err := prefix6Map.Put(key, present); err != nil {
+			return fmt.Errorf("failed to update IPv6 prefix map: %v", err)
+		}
+		log.Printf("eBPF network filter: %s/%d", net.IP(key.Addr[:]).String(), key.Prefixlen)
 	}
 
 	// Write mask bitmap
-	if err := maskMap.Put(countKey, maskBitmap); err != nil {
+	if err := maskMap.Put(countKey, data.maskBitmap); err != nil {
 		return fmt.Errorf("failed to update mask bitmap: %v", err)
 	}
 
 	// Update bloom filter words
 	for i := 0; i < bloomWordCount; i++ {
 		key := uint32(i)
-		if err := bloomMap.Put(key, bloomWords[i]); err != nil {
+		if err := bloomMap.Put(key, data.bloomWords[i]); err != nil {
 			return fmt.Errorf("failed to update bloom word %d: %v", i, err)
 		}
 	}
 
 	log.Printf("eBPF optimization: network_count=%d", networkCount)
 	return nil
+}
+
+type networkFilterData struct {
+	entries    []prefixKey
+	entriesV6  []lpmKeyV6
+	maskBitmap uint32
+	bloomWords []uint32
+}
+
+// buildNetworkFilterData converts allowed networks into deduplicated eBPF
+// filter entries. IPv4 prefixes (/1../32) go to the bloom+hash filter,
+// IPv6 prefixes (/1../128) to the LPM trie. /0 masks are skipped.
+func buildNetworkFilterData(allowedNets []*net.IPNet) networkFilterData {
+	data := networkFilterData{
+		bloomWords: make([]uint32, bloomWordCount),
+	}
+	seen := make(map[prefixKey]struct{}, len(allowedNets))
+	seenV6 := make(map[lpmKeyV6]struct{}, len(allowedNets))
+
+	for _, ipnet := range allowedNets {
+		ones, bits := ipnet.Mask.Size()
+
+		if ip := ipnet.IP.To4(); ip != nil {
+			if bits != 32 || ones <= 0 || ones > 32 {
+				log.Printf("Skipping unsupported network mask: %s", ipnet.String())
+				continue
+			}
+
+			maskBits := uint8(ones)
+			netAddr := binary.BigEndian.Uint32(ip)
+			netMask := binary.BigEndian.Uint32(ipnet.Mask)
+			prefix := netAddr & netMask
+
+			key := prefixKey{Prefix: prefix, MaskBits: maskBits}
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+
+			data.entries = append(data.entries, key)
+			data.maskBitmap |= 1 << (maskBits - 1)
+			setBloomBits(data.bloomWords, prefix, maskBits)
+			continue
+		}
+
+		// IPv6
+		if bits != 128 || ones <= 0 || ones > 128 {
+			log.Printf("Skipping unsupported network mask: %s", ipnet.String())
+			continue
+		}
+
+		key := lpmKeyV6{Prefixlen: uint32(ones)}
+		copy(key.Addr[:], ipnet.IP.Mask(ipnet.Mask).To16())
+		if _, dup := seenV6[key]; dup {
+			continue
+		}
+		seenV6[key] = struct{}{}
+
+		data.entriesV6 = append(data.entriesV6, key)
+	}
+
+	return data
 }
 
 func setBloomBits(words []uint32, prefix uint32, maskBits uint8) {
@@ -1266,19 +1335,4 @@ func sendInfluxBatch(metrics []string, cfg *Config) {
 	if cfg.Verbose {
 		log.Printf("Sent %d metrics to InfluxDB", len(metrics))
 	}
-}
-
-func u32ToIP(v uint32) net.IP {
-	// IP addresses from eBPF are in network byte order, but we need to convert
-	// them to host byte order for proper display
-	b := make([]byte, 4)
-	binary.LittleEndian.PutUint32(b, v)
-	return net.IP(b)
-}
-
-func u32ToIPString(v uint32) string {
-	// Direct conversion to string without intermediate allocations
-	var buf [4]byte
-	binary.LittleEndian.PutUint32(buf[:], v)
-	return fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
 }
