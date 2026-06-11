@@ -14,7 +14,7 @@ High-performance eBPF network monitoring tool that tracks per-IP traffic statist
 
 ## What it does
 
-Captures network traffic using eBPF, calculates per-IP statistics (PPS, Mbps), and can automatically ban IPs exceeding thresholds. Exports metrics to Graphite for monitoring dashboards.
+Captures network traffic using eBPF, calculates per-IP statistics (PPS, Mbps) for both IPv4 and IPv6, and can automatically ban IPs exceeding thresholds. Exports metrics to Graphite for monitoring dashboards.
 
 ## Quick start
 
@@ -45,7 +45,7 @@ Requires root for eBPF attachment.
 
 **Smart filtering**: Only export meaningful metrics to Graphite with `-min-flow-pps` and `-min-ips-pps`.
 
-**Production ready**: Install as systemd service with auto-restart and logging.
+**Production ready**: Install as systemd service with auto-restart and logging. Automatically re-attaches eBPF programs when the monitored interface restarts (e.g. after VyOS/router config commits).
 
 **Automatic banning**: Set thresholds for PPS/Mbps and execute custom scripts when exceeded.
 
@@ -88,8 +88,9 @@ Requires root for eBPF attachment.
 When thresholds are exceeded, your script gets called:
 
 ```bash
-/path/to/script.sh ban 192.168.1.100    # IP exceeded threshold
+/path/to/script.sh ban 192.168.1.100    # IPv4 exceeded threshold
 /path/to/script.sh unban 192.168.1.100  # Ban expired
+/path/to/script.sh ban 2001:db8::1      # IPv6 is passed the same way
 ```
 
 The IP can be IPv4 or IPv6, so the script should handle both:
@@ -108,6 +109,8 @@ esac
 
 Flow metrics: `network.flows.{SRC_IP}_to_{DST_IP}.{pps,mbps}.{rx,tx}`
 IP metrics: `network.ips.{IP_ADDRESS}.{pps,mbps}.{rx,tx}`
+
+Address separators are sanitized to `_` (`.` for IPv4, `:` for IPv6), e.g. `2001:db8::1` → `2001_db8__1`.
 
 Use filtering (`-min-*`) to avoid noise from low-traffic flows.
 

@@ -15,6 +15,8 @@ eBPF-based tool for real-time per-IP traffic monitoring with dual metrics export
 
 ## Architecture
 **Core**: eBPF (flow.c) → Go collector → Graphite/InfluxDB export + IP banning
+**Flow key**: unified 16-byte address (IPv4 stored as IPv4-mapped `::ffff:a.b.c.d`)
+**Filtering**: dual-stack in eBPF — IPv4 via bloom filter + hash map, IPv6 via LPM trie
 **Metrics**: Flow pairs (`fastflowips.flows.src_to_dst.*`) + IP aggregates (`fastflowips.ips.ip.*`)
 **Direction**: RX=traffic-to-internal, TX=traffic-from-internal (internal IP perspective)
 **Threading**: Thread-safe metrics export with mutex-protected connections
@@ -38,6 +40,7 @@ eBPF-based tool for real-time per-IP traffic monitoring with dual metrics export
 ## Formats
 **Graphite**: `fastflowips.flows.192_168_1_1_to_10_0_0_1.pps.rx 123.45 1699123456`
 **InfluxDB**: `fastflowips_flows,src=192_168_1_1,dst=10_0_0_1,type=pps,direction=rx value=123.45 1699123456000000000`
+**IPv6**: `.` and `:` are sanitized to `_` (e.g. `2001:db8::1` → `2001_db8__1`), so a v6 flow reads `fastflowips.flows.2001_db8__1_to_2001_db8__2.pps.rx`
 
 ## Development Environment
 ```bash

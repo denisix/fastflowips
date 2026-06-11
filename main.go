@@ -771,74 +771,127 @@ func main() {
 		log.Fatalf("BPF map 'flow_cnt' not found")
 	}
 
-	// Ensure clsact qdisc exists
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: iface.Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
-	}
-	if err := netlink.QdiscAdd(qdisc); err != nil {
-		// It's fine if it already exists
-		if !os.IsExist(err) {
-			log.Printf("QdiscAdd: %v (often safe to ignore if 'file exists')", err)
+	var filterMu sync.Mutex
+	var filterIngress, filterEgress *netlink.BpfFilter
+
+	attachTC := func(nlIface netlink.Link) error {
+		qdisc := &netlink.GenericQdisc{
+			QdiscAttrs: netlink.QdiscAttrs{
+				LinkIndex: nlIface.Attrs().Index,
+				Handle:    netlink.MakeHandle(0xffff, 0),
+				Parent:    netlink.HANDLE_CLSACT,
+			},
+			QdiscType: "clsact",
 		}
+		if err := netlink.QdiscAdd(qdisc); err != nil {
+			if !os.IsExist(err) {
+				log.Printf("QdiscAdd: %v (often safe to ignore if 'file exists')", err)
+			}
+		}
+
+		timestamp := uint16(time.Now().Unix() & 0xFFFF)
+		ingressHandle := netlink.MakeHandle(timestamp, 1)
+		egressHandle := netlink.MakeHandle(timestamp, 2)
+
+		if config.Verbose {
+			log.Printf("Using handles: ingress=%x, egress=%x", ingressHandle, egressHandle)
+		}
+
+		newIn := &netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				LinkIndex: nlIface.Attrs().Index,
+				Parent:    netlink.HANDLE_MIN_INGRESS,
+				Handle:    ingressHandle,
+				Protocol:  syscall.ETH_P_ALL,
+				Priority:  1,
+			},
+			Fd:           progIngress.FD(),
+			Name:         "count_flows_ingress",
+			DirectAction: true,
+		}
+		stdIface := &net.Interface{Index: nlIface.Attrs().Index, Name: nlIface.Attrs().Name}
+		if err := addFilterWithRetry(newIn, "ingress", stdIface); err != nil {
+			return err
+		}
+
+		newEg := &netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				LinkIndex: nlIface.Attrs().Index,
+				Parent:    netlink.HANDLE_MIN_EGRESS,
+				Handle:    egressHandle,
+				Protocol:  syscall.ETH_P_ALL,
+				Priority:  1,
+			},
+			Fd:           progEgress.FD(),
+			Name:         "count_flows_egress",
+			DirectAction: true,
+		}
+		if err := addFilterWithRetry(newEg, "egress", stdIface); err != nil {
+			return err
+		}
+
+		filterMu.Lock()
+		filterIngress = newIn
+		filterEgress = newEg
+		filterMu.Unlock()
+		return nil
 	}
 
-	// Use timestamp-based handles to avoid conflicts
-	timestamp := uint16(time.Now().Unix() & 0xFFFF)
-	ingressHandle := netlink.MakeHandle(timestamp, 1)
-	egressHandle := netlink.MakeHandle(timestamp, 2)
-
-	if config.Verbose {
-		log.Printf("Using handles: ingress=%x, egress=%x", ingressHandle, egressHandle)
+	// Get netlink handle for the interface
+	nlIface, err := netlink.LinkByName(config.Interface)
+	if err != nil {
+		log.Fatalf("netlink: interface %s: %v", config.Interface, err)
 	}
 
-	// Attach BPF to TC ingress using netlink directly
-	filterIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: iface.Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    ingressHandle,
-			Protocol:  syscall.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           progIngress.FD(),
-		Name:         "count_flows_ingress",
-		DirectAction: true,
-	}
-
-	if err := addFilterWithRetry(filterIngress, "ingress", iface); err != nil {
-		log.Fatalf("%v", err)
-	}
-
-	// Attach BPF to TC egress
-	filterEgress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: iface.Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
-			Handle:    egressHandle,
-			Protocol:  syscall.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           progEgress.FD(),
-		Name:         "count_flows_egress",
-		DirectAction: true,
-	}
-
-	if err := addFilterWithRetry(filterEgress, "egress", iface); err != nil {
+	if err := attachTC(nlIface); err != nil {
 		log.Fatalf("%v", err)
 	}
 
 	log.Printf("Attached TC eBPF classifiers on %s ingress/egress", config.Interface)
 
+	// Watch for interface restarts and re-attach eBPF programs
+	linkUpdates := make(chan netlink.LinkUpdate)
+	linkDone := make(chan struct{})
+	if err := netlink.LinkSubscribe(linkUpdates, linkDone); err != nil {
+		log.Printf("Warning: cannot subscribe to link updates, won't auto-recover from interface restarts: %v", err)
+	} else {
+		go func() {
+			for update := range linkUpdates {
+				if update.Attrs().Name != config.Interface {
+					continue
+				}
+				if update.IfInfomsg.Flags&syscall.IFF_UP == 0 {
+					continue
+				}
+				// Small delay to let the kernel finish bringing the interface up
+				time.Sleep(500 * time.Millisecond)
+				newLink, err := netlink.LinkByName(config.Interface)
+				if err != nil {
+					log.Printf("Re-attach: cannot get interface %s: %v", config.Interface, err)
+					continue
+				}
+				if err := attachTC(newLink); err != nil {
+					log.Printf("Re-attach TC failed on %s: %v", config.Interface, err)
+					continue
+				}
+				log.Printf("Re-attached TC eBPF classifiers on %s after interface restart", config.Interface)
+			}
+		}()
+	}
+
 	// Cleanup function
 	defer func() {
+		close(linkDone)
 		log.Printf("Cleaning up eBPF programs...")
-		netlink.FilterDel(filterIngress)
-		netlink.FilterDel(filterEgress)
+		filterMu.Lock()
+		fi, fe := filterIngress, filterEgress
+		filterMu.Unlock()
+		if fi != nil {
+			netlink.FilterDel(fi)
+		}
+		if fe != nil {
+			netlink.FilterDel(fe)
+		}
 		if graphiteConn != nil {
 			graphiteConn.Close()
 		}
