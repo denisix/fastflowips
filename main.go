@@ -5,6 +5,7 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -771,6 +772,16 @@ func main() {
 		log.Fatalf("BPF map 'flow_cnt' not found")
 	}
 
+	// Kernel program IDs, used to verify our TC filters are still attached.
+	// ID 0 means the kernel doesn't report IDs; we fall back to name matching.
+	var ingressProgID, egressProgID ebpf.ProgramID
+	if info, err := progIngress.Info(); err == nil {
+		ingressProgID, _ = info.ID()
+	}
+	if info, err := progEgress.Info(); err == nil {
+		egressProgID, _ = info.ID()
+	}
+
 	var filterMu sync.Mutex
 	var filterIngress, filterEgress *netlink.BpfFilter
 
@@ -837,6 +848,72 @@ func main() {
 		return nil
 	}
 
+	hasFilter := func(link netlink.Link, parent uint32, progID ebpf.ProgramID, name string) bool {
+		filters, err := netlink.FilterList(link, parent)
+		if err != nil {
+			// Cannot tell; assume attached to avoid churning filters on transient errors
+			return true
+		}
+		for _, f := range filters {
+			bf, ok := f.(*netlink.BpfFilter)
+			if !ok {
+				continue
+			}
+			if progID != 0 && bf.Id == int(progID) {
+				return true
+			}
+			if strings.HasPrefix(bf.Name, name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Re-apply TC filters only when they are actually gone. Serialized so the
+	// link watcher and the periodic check cannot attach concurrently and stack
+	// duplicate filters.
+	var attachMu sync.Mutex
+	reattachIfMissing := func(link netlink.Link) (bool, error) {
+		attachMu.Lock()
+		defer attachMu.Unlock()
+		if hasFilter(link, netlink.HANDLE_MIN_INGRESS, ingressProgID, "count_flows_ingress") &&
+			hasFilter(link, netlink.HANDLE_MIN_EGRESS, egressProgID, "count_flows_egress") {
+			return false, nil
+		}
+		if err := attachTC(link); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// Verify our TC filters are still attached and re-apply them if not.
+	// External tc changes (e.g. VyOS config commits rewriting qdiscs) remove
+	// our filters without any link up/down event, so the link watcher alone
+	// cannot catch this.
+	var attachLost bool
+	ensureAttached := func() {
+		link, err := netlink.LinkByName(config.Interface)
+		if err != nil {
+			if !attachLost {
+				log.Printf("Attachment check: interface %s not found: %v (will keep retrying)", config.Interface, err)
+				attachLost = true
+			}
+			return
+		}
+		attached, err := reattachIfMissing(link)
+		if err != nil {
+			if !attachLost {
+				log.Printf("Re-attach TC failed on %s: %v (will retry every %v)", config.Interface, err, config.Interval)
+			}
+			attachLost = true
+			return
+		}
+		attachLost = false
+		if attached {
+			log.Printf("TC filters were missing on %s (external tc/qdisc change?), re-attached eBPF classifiers", config.Interface)
+		}
+	}
+
 	// Get netlink handle for the interface
 	nlIface, err := netlink.LinkByName(config.Interface)
 	if err != nil {
@@ -849,13 +926,22 @@ func main() {
 
 	log.Printf("Attached TC eBPF classifiers on %s ingress/egress", config.Interface)
 
-	// Watch for interface restarts and re-attach eBPF programs
-	linkUpdates := make(chan netlink.LinkUpdate)
+	// Watch for interface restarts and re-attach eBPF programs. This is the
+	// fast path; the periodic ensureAttached() check in the collection loop
+	// is the safety net for tc changes that don't generate link events.
 	linkDone := make(chan struct{})
-	if err := netlink.LinkSubscribe(linkUpdates, linkDone); err != nil {
-		log.Printf("Warning: cannot subscribe to link updates, won't auto-recover from interface restarts: %v", err)
-	} else {
-		go func() {
+	go func() {
+		for {
+			linkUpdates := make(chan netlink.LinkUpdate)
+			if err := netlink.LinkSubscribe(linkUpdates, linkDone); err != nil {
+				log.Printf("Warning: cannot subscribe to link updates, retrying in 5s: %v", err)
+				select {
+				case <-linkDone:
+					return
+				case <-time.After(5 * time.Second):
+					continue
+				}
+			}
 			for update := range linkUpdates {
 				if update.Attrs().Name != config.Interface {
 					continue
@@ -870,14 +956,26 @@ func main() {
 					log.Printf("Re-attach: cannot get interface %s: %v", config.Interface, err)
 					continue
 				}
-				if err := attachTC(newLink); err != nil {
+				attached, err := reattachIfMissing(newLink)
+				if err != nil {
 					log.Printf("Re-attach TC failed on %s: %v", config.Interface, err)
 					continue
 				}
-				log.Printf("Re-attached TC eBPF classifiers on %s after interface restart", config.Interface)
+				if attached {
+					log.Printf("Re-attached TC eBPF classifiers on %s after interface restart", config.Interface)
+				}
 			}
-		}()
-	}
+			// Subscription channel closed: either we are shutting down, or the
+			// netlink socket failed (e.g. buffer overrun) and we must resubscribe.
+			select {
+			case <-linkDone:
+				return
+			default:
+			}
+			log.Printf("Link update subscription closed, resubscribing...")
+			time.Sleep(time.Second)
+		}
+	}()
 
 	// Cleanup function
 	defer func() {
@@ -916,6 +1014,7 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
+			ensureAttached()
 			checkExpiredBans(config.BanScript)
 			processMap(flowMap, config)
 		case <-sigCh:
@@ -971,6 +1070,35 @@ func calculateFlowMetrics(current, prev FlowStats, deltaTime float64) (float64, 
 }
 
 func collectFlowData(m *ebpf.Map, cfg *Config, deltaTime float64) ([]FlowData, map[FlowKey]FlowStats) {
+	var currentFlowData map[FlowKey]FlowStats
+	var flows []FlowData
+
+	// The kernel aborts hash map iteration when the map is mutated too much
+	// concurrently (eBPF programs keep updating it); retry once from scratch
+	// before settling for partial data.
+	for attempt := 0; attempt < 2; attempt++ {
+		var aborted bool
+		flows, currentFlowData, aborted = iterateFlowMap(m, cfg, deltaTime)
+		if !aborted {
+			break
+		}
+		if attempt == 0 {
+			if cfg.Verbose {
+				log.Printf("Flow map iteration aborted by concurrent updates, retrying")
+			}
+		} else {
+			log.Printf("Flow map iteration aborted twice by concurrent updates; using partial data (%d flows)", len(flows))
+		}
+	}
+
+	if cfg.Verbose {
+		log.Printf("eBPF flows: %d, processed flows: %d", len(currentFlowData), len(flows))
+	}
+
+	return flows, currentFlowData
+}
+
+func iterateFlowMap(m *ebpf.Map, cfg *Config, deltaTime float64) ([]FlowData, map[FlowKey]FlowStats, bool) {
 	currentFlowData := make(map[FlowKey]FlowStats)
 	flows := make([]FlowData, 0, 64) // Pre-allocate with reasonable capacity
 
@@ -1026,16 +1154,15 @@ func collectFlowData(m *ebpf.Map, cfg *Config, deltaTime float64) ([]FlowData, m
 	statsMu.RUnlock()
 
 	if err := it.Err(); err != nil {
+		if errors.Is(err, ebpf.ErrIterationAborted) {
+			return flows, currentFlowData, true
+		}
 		log.Printf("Flow map iteration error: %v", err)
 	} else if cfg.DebugFlows {
 		log.Printf("[flow-debug] iteration summary: ebpf_flows=%d processed=%d delta_time=%.3fs", ebpfFlowCount, len(flows), deltaTime)
 	}
 
-	if cfg.Verbose {
-		log.Printf("eBPF flows: %d, processed flows: %d", ebpfFlowCount, len(flows))
-	}
-
-	return flows, currentFlowData
+	return flows, currentFlowData, false
 }
 
 type IPStatsMap map[string]struct{ ppsRx, ppsTx, mbpsRx, mbpsTx float64 }
